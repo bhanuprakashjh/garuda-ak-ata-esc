@@ -1,0 +1,233 @@
+/**
+ * @file hal_ptg.c
+ * @brief PTG implementation — Phase 1 heartbeat (AK port).
+ *
+ * See hal_ptg.h for the architectural overview.
+ *
+ * Step queue layout (4 bytes packed into PTGQUE0 — STEP0 = LSB):
+ *   STEP0: PTGWHI | 0       0x40    wait for PTG Input 0 rising edge
+ *                                   (= PWM1 ADC Trigger 2 = PG1TRIGB match)
+ *   STEP1: PTGIRQ | 0       0x70    generate _PTG0Interrupt
+ *   STEP2: PTGJMP | 0       0xA0    jump back to STEP0
+ *   STEP3: (NOP, unreached) 0x00
+ * Packed: PTGQUE0 = 0x00A07040.
+ *
+ * Opcode encoding verified against DS70005539 Table 26-5 (matches CK
+ * DS70005349 Table 24-1 — same family encoding).
+ *
+ * PTGCON:
+ *   ON       = 1   peripheral enabled
+ *   PTGDIV   = 0   clock = FCY/1 = 200 MHz → 5 ns/PTG-tick
+ *   PTGITM   = 0   continuous, all input triggers visible
+ *   PTGSSEN  = 0   no single-step
+ *   PTGSTRT  = 1   begin queue execution
+ */
+
+#include <xc.h>
+#include <stdint.h>
+#include "hal_ptg.h"
+#include "port_config.h"           /* BEMF_x_GetValue() macros */
+#include "../garuda_config.h"
+#include "../garuda_service.h"     /* V4_ProcessBemfSample() */
+
+/* ── Globals (defined here, externed from hal_ptg.h) ──────────────── */
+volatile uint32_t v5_ptgFires      = 0;
+volatile uint32_t v5_ptgRisingAcc  = 0;
+volatile uint32_t v5_ptgRisingRej  = 0;
+volatile uint32_t v5_ptgFallingAcc = 0;
+volatile uint32_t v5_ptgFallingRej = 0;
+volatile uint32_t v5_ptgSkipped    = 0;
+
+/* Per-sector expected post-ZC comparator state — written by Commutate
+ * in sector_pi.c when V5_POST_ZC_ACCEPT is enabled.  Read by Phase 2
+ * BEMF ISR to classify accept vs reject. */
+volatile uint8_t  v5_ptgExpectedComp = 0;
+
+/* ── PTG step-command opcodes (DS70005539 Table 26-5) ─────────────── */
+#define PTG_OP_CTRL     (0x0u << 4)   /* 0x00 — PTGCTRL  */
+#define PTG_OP_WHI      (0x4u << 4)   /* 0x40 — wait for trigger rising  */
+#define PTG_OP_WLO      (0x5u << 4)   /* 0x50 — wait for trigger falling */
+#define PTG_OP_IRQ      (0x7u << 4)   /* 0x70 — generate IRQ (operand selects PTG0..3) */
+#define PTG_OP_JMP      (0xAu << 4)   /* 0xA0 — jump (operand = step index) */
+
+/* ISR priority — sits between ADC (3) and CCP (5/6 on CK; AK uses
+ * Timer1=4, CCP=5 typically).  Setting PTG to 5 means CCP still
+ * preempts, but PTG preempts ADC.  Phase 2 may need to raise this. */
+#ifndef HAL_PTG_ISR_PRIORITY
+#define HAL_PTG_ISR_PRIORITY    5U
+#endif
+
+void HAL_PTG_Init(void)
+{
+    /* Disable everything before configuring.  Writing PTGCON.ON = 0
+     * with PTGSTRT = 0 puts the peripheral into a known idle state. */
+    PTGCON   = 0x00000000UL;
+    PTGT0LIM = 0;
+    PTGT1LIM = 0;
+    PTGSDLIM = 0;       /* no per-step delay */
+    PTGC0LIM = 0;
+    PTGC1LIM = 0;
+    PTGBTE   = 0;
+    PTGHOLD  = 0;
+    PTGQPTR  = 0;       /* start at STEP0 */
+
+    /* Step queue — see file header for the assembled bytes. */
+    PTGQUE0  = ((uint32_t)(PTG_OP_WHI | 0x0))            /* STEP0 */
+             | ((uint32_t)(PTG_OP_IRQ | 0x0) << 8)       /* STEP1 */
+             | ((uint32_t)(PTG_OP_JMP | 0x0) << 16);     /* STEP2 */
+    PTGQUE1  = 0;
+    PTGQUE2  = 0;
+    PTGQUE3  = 0;
+    PTGQUE4  = 0;
+    PTGQUE5  = 0;
+    PTGQUE6  = 0;
+    PTGQUE7  = 0;
+
+    /* IRQ output 0 → _PTG0Interrupt.  Configure priority and clear the
+     * flag, leave the IE disabled until HAL_PTG_Start(). */
+    _PTG0IF  = 0;
+    _PTG0IP  = HAL_PTG_ISR_PRIORITY;
+    _PTG0IE  = 0;
+}
+
+void HAL_PTG_Start(void)
+{
+    /* Re-init each start for clean post-desync state. */
+    HAL_PTG_Init();
+
+    v5_ptgFires        = 0;
+    v5_ptgRisingAcc    = 0;
+    v5_ptgRisingRej    = 0;
+    v5_ptgFallingAcc   = 0;
+    v5_ptgFallingRej   = 0;
+
+    _PTG0IF = 0;
+    _PTG0IE = 1;
+
+    PTGCONbits.ON      = 1;     /* enable peripheral */
+    PTGCONbits.PTGSTRT = 1;     /* begin step-queue execution */
+}
+
+void HAL_PTG_Stop(void)
+{
+    PTGCONbits.PTGSTRT = 0;
+    PTGCONbits.ON      = 0;
+    _PTG0IE = 0;
+    _PTG0IF = 0;
+}
+
+/* ── PTG0 ISR ──────────────────────────────────────────────────────
+ * Fires at every PG1TRIGB match (PWM mid-OFF, period boundary, by
+ * default — same instant the BEMF GPIO is stable for sampling).
+ *
+ *  - v5_ptgFires++ runs always (heartbeat / Phase 1 diagnostic).
+ *  - When FEATURE_BEMF_VIA_PTG=1 (Phase 2), V4_ProcessBemfSample()
+ *    runs here instead of inside the ADC ISR.  The ADC ISR retains
+ *    POT/Vbus/current responsibilities only.  Latency drops from
+ *    ~1.5 µs (ADC scan complete) to ~50 ns (ISR vector). */
+#if FEATURE_DUAL_POS_PROBE
+/* B2 dual-position probe: ISR-local toggle to know whether the current
+ * fire is at MID-OFF (PG1TRIGB=1) or MID-ON (PG1TRIGB=MPER-1). After
+ * processing the current sample, write the OTHER position into PG1TRIGB
+ * so the next fire lands at the alternate point. */
+static volatile uint8_t v5_sampleAtMidOn = 0;
+extern volatile uint32_t v5_midOnFallingAcc;
+extern volatile uint32_t v5_midOnFallingRej;
+extern volatile uint8_t  v5_ptgExpectedComp;
+
+/* Tiny helper — single comp read on mid-ON fire, classify against the
+ * sector's expected post-ZC state. Falling sectors only (rising path is
+ * still served by the mid-OFF V4_ProcessBemfSample call). */
+extern volatile uint8_t v4_floatingPhase;
+static inline void DiagnosticMidOnFallingSample(void)
+{
+    uint8_t expectedPost = v5_ptgExpectedComp;
+    if (expectedPost != 0u) {  /* falling sector */
+        uint8_t comp;
+        switch (v4_floatingPhase) {
+            case 0:  comp = BEMF_A_GetValue(); break;
+            case 1:  comp = BEMF_B_GetValue(); break;
+            default: comp = BEMF_C_GetValue(); break;
+        }
+        if (comp == expectedPost) v5_midOnFallingAcc++;
+        else                      v5_midOnFallingRej++;
+    }
+}
+#endif
+
+void __attribute__((interrupt, no_auto_psv)) _PTG0Interrupt(void)
+{
+    _PTG0IF = 0;
+    v5_ptgFires++;
+#if FEATURE_BEMF_VIA_PTG && FEATURE_V4_MIDPOINT_ZC == 1
+  #if PTG_POSTSCALE_N > 1U
+    /* CK-rate experiment: process 1 of every PTG_POSTSCALE_N fires. */
+    static uint8_t postscaler = 0;
+    if (++postscaler < PTG_POSTSCALE_N) {
+        v5_ptgSkipped++;
+        PG1TRIGB = PTG_TRIG_MID_ON_POS;   /* keep next fire armed at MID-ON */
+        return;
+    }
+    postscaler = 0;
+  #endif
+  #if FEATURE_DUAL_POS_PROBE
+    if (v5_sampleAtMidOn) {
+        /* This fire was at MID-ON — diagnostic only, no PI feed. */
+        DiagnosticMidOnFallingSample();
+        PG1TRIGB = PTG_TRIG_MID_OFF_POS;
+        v5_sampleAtMidOn = 0;
+    } else {
+        /* This fire was at MID-OFF — normal BEMF processing + PI feed. */
+        V4_ProcessBemfSample();
+        PG1TRIGB = PTG_TRIG_MID_ON_POS;
+        v5_sampleAtMidOn = 1;
+    }
+  #elif FEATURE_PER_SECTOR_PTG
+    /* 2026-05-15 — duty-adaptive sample position.
+     *
+     * Center-aligned PWM: OFF window is (1-duty)·period wide, ON window
+     * is duty·period. Below 50% duty the OFF window is wider → MID-OFF
+     * is the cleanest spot, max distance from switching edges. Above
+     * 50% the ON window is wider → MID-ON is the cleanest spot.
+     *
+     * Empirical evidence (this commit's MID-OFF-only run):
+     *   - Idle currents at MID-OFF were ~5A vs ~12A at MID-ON (2.4× drop).
+     *   - pR/pF balance ~40/60 at MID-OFF vs 0-1/99 at MID-ON.
+     *   - MID-OFF desyncs above ~80% duty (OFF window too narrow for
+     *     PTG ISR latency + 3-read deglitch to stay inside).
+     *
+     * Picking position per fire based on the active duty:
+     *   below threshold → MID-OFF (low-duty regime)
+     *   above threshold → MID-ON  (high-duty regime, BC vicinity)
+     * Hysteresis band (±5% around 50%) prevents chatter when the PI
+     * has the duty hunting across the boundary. */
+    V4_ProcessBemfSample();
+    {
+        extern volatile uint16_t g_pwmActualDuty;
+        static uint8_t lastWasMidOn = 0;   /* sticky for hysteresis */
+        uint16_t duty = g_pwmActualDuty;
+        if (lastWasMidOn) {
+            /* currently MID-ON — drop to MID-OFF only when duty falls
+             * well below threshold (50% - hyst) */
+            if (duty < (PTG_DUTY_ADAPT_THRESHOLD - PTG_DUTY_ADAPT_HYST)) {
+                PG1TRIGB = PTG_TRIG_MID_OFF_POS;
+                lastWasMidOn = 0;
+            } else {
+                PG1TRIGB = PTG_TRIG_MID_ON_POS;
+            }
+        } else {
+            /* currently MID-OFF — climb to MID-ON only when duty rises
+             * well above threshold (50% + hyst) */
+            if (duty > (PTG_DUTY_ADAPT_THRESHOLD + PTG_DUTY_ADAPT_HYST)) {
+                PG1TRIGB = PTG_TRIG_MID_ON_POS;
+                lastWasMidOn = 1;
+            } else {
+                PG1TRIGB = PTG_TRIG_MID_OFF_POS;
+            }
+        }
+    }
+  #else
+    V4_ProcessBemfSample();
+  #endif
+#endif
+}

@@ -1,0 +1,41 @@
+# MPLAB X build outputs
+firmware/build/
+firmware/dist/
+firmware/debug/
+firmware/.generated_files/
+
+# MPLAB private project state (per-user paths, timestamps)
+firmware/nbproject/private/
+firmware/nbproject/Makefile-genesis.properties
+
+# Object/binary/listing files
+*.o
+*.elf
+*.hex
+*.map
+*.lst
+*.lzs
+*.s
+
+# Bench/test artifacts
+*.csv
+*.log
+ak_telem_*.csv
+run*.csv
+__pycache__/
+*.pyc
+
+# Editor/OS noise
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# MCP / local config that may contain credentials
+.mcp.json
+
+# Build helper scripts that point at local toolchains
+build/
+dist/
