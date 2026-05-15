@@ -555,12 +555,34 @@ void GSP_DispatchCommand(uint8_t cmdId, const uint8_t *payload, uint8_t payloadL
         }
 
         case GSP_CMD_GET_SNAPSHOT:
+            /* One-shot snapshot for the GUI's connect handshake.
+             * The GUI sends GET_SNAPSHOT immediately after GET_INFO and
+             * needs *real* bytes back; without this the CK Dashboard
+             * sticks on "Waiting for CK board telemetry..." until the
+             * user manually presses Start Telemetry.
+             *
+             * We force-fire GSP_TelemTick() which pushes a TELEM_FRAME
+             * (cmd 0x80) carrying the full 250-byte payload. The GUI
+             * handles TELEM_FRAME and GET_SNAPSHOT through the same
+             * decodeCkSnapshot() path so the dashboard populates as
+             * soon as the frame lands. The trailing empty
+             * GET_SNAPSHOT ack keeps the protocol-level promise that
+             * every command produces a response. */
+            {
+                bool wasActive = v4_telemActive;
+                v4_telemActive   = true;
+                v4_telemLastTick = gV4SystemTick - 1000U;  /* defeat 100 ms rate-limit */
+                GSP_TelemTick();
+                v4_telemActive = wasActive;
+            }
+            GSP_SendResponse(GSP_CMD_GET_SNAPSHOT, NULL, 0);
+            break;
+
         case GSP_CMD_TELEM_START:
         case GSP_CMD_TELEM_STOP:
-            /* Handled below in TelemTick */
             if (cmdId == GSP_CMD_TELEM_START)
                 v4_telemActive = true;
-            else if (cmdId == GSP_CMD_TELEM_STOP)
+            else
                 v4_telemActive = false;
             GSP_SendResponse(cmdId, NULL, 0);
             break;
