@@ -1,0 +1,520 @@
+import { useState, useMemo, useEffect, useRef } from 'react';
+import { useEscStore } from '../store/useEscStore';
+import { isFocEnabled, isCkBoard, CK_CURRENT_SCALE, CK_VBUS_SCALE } from '../protocol/types';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
+import type { GspSnapshot, CkSnapshot } from '../protocol/types';
+
+interface ScopeChannel {
+  key: string;
+  label: string;
+  unit: string;
+  color: string;
+  extract: (s: GspSnapshot, info: { polePairs: number }) => number;
+  group: string;
+  focOnly?: boolean;
+  sixStepOnly?: boolean;
+}
+
+/* CK board channels — separate type, same visual interface */
+interface CkScopeChannel {
+  key: string;
+  label: string;
+  unit: string;
+  color: string;
+  extract: (s: CkSnapshot, info: { polePairs: number }) => number;
+  group: string;
+}
+
+const CK_CHANNELS: CkScopeChannel[] = [
+  { key: 'ckErpm', label: 'eRPM', unit: 'eRPM', color: '#3b82f6', group: 'Speed',
+    extract: (s) => s.eRpm },
+  { key: 'ckMechRpm', label: 'Mech RPM', unit: 'RPM', color: '#60a5fa', group: 'Speed',
+    extract: (s, i) => i.polePairs > 0 ? Math.round(s.eRpm / i.polePairs) : s.eRpm },
+  { key: 'ckDuty', label: 'Duty', unit: '%', color: '#f472b6', group: 'Speed',
+    extract: (s) => s.dutyPct },
+  { key: 'ckStepPeriod', label: 'Step Period', unit: 'ticks', color: '#64748b', group: 'Speed',
+    extract: (s) => s.stepPeriod },
+
+  { key: 'ckVbus', label: 'Vbus', unit: 'V', color: '#22c55e', group: 'Power',
+    extract: (s) => +(s.vbusRaw / CK_VBUS_SCALE).toFixed(2) },
+  { key: 'ckIa', label: 'Phase A (Ia)', unit: 'mA', color: '#60a5fa', group: 'Power',
+    extract: (s) => Math.round(s.iaRaw * CK_CURRENT_SCALE) },
+  { key: 'ckIb', label: 'Phase B (Ib)', unit: 'mA', color: '#34d399', group: 'Power',
+    extract: (s) => Math.round(s.ibRaw * CK_CURRENT_SCALE) },
+  { key: 'ckIbus', label: 'Bus Current', unit: 'mA', color: '#f97316', group: 'Power',
+    extract: (s) => Math.round(s.ibusRaw * CK_CURRENT_SCALE) },
+
+  { key: 'ckGoodZc', label: 'Good ZC', unit: '', color: '#22d3ee', group: 'ZC',
+    extract: (s) => s.goodZcCount },
+  { key: 'ckZcInterval', label: 'ZC Interval', unit: '', color: '#2dd4bf', group: 'ZC',
+    extract: (s) => s.zcInterval },
+  { key: 'ckFilterLevel', label: 'Filter Level', unit: '', color: '#a78bfa', group: 'ZC',
+    extract: (s) => s.filterLevel },
+  { key: 'ckMissed', label: 'Missed Steps', unit: '', color: '#ef4444', group: 'ZC',
+    extract: (s) => s.missedSteps },
+  { key: 'ckForced', label: 'Forced Steps', unit: '', color: '#f43f5e', group: 'ZC',
+    extract: (s) => s.forcedSteps },
+  { key: 'ckIcAccepted', label: 'IC Accepted', unit: '', color: '#06b6d4', group: 'ZC',
+    extract: (s) => s.icAccepted },
+  { key: 'ckIcFalse', label: 'IC False', unit: '', color: '#dc2626', group: 'ZC',
+    extract: (s) => s.icFalse },
+  { key: 'ckPot', label: 'Pot', unit: '', color: '#c084fc', group: 'Input',
+    extract: (s) => s.potRaw },
+];
+
+const CK_PRESETS: Record<string, { label: string; channels: string[] }> = {
+  ckOverview: { label: 'Overview', channels: ['ckErpm', 'ckDuty', 'ckVbus', 'ckIbus'] },
+  ckCurrents: { label: 'Currents', channels: ['ckIa', 'ckIb', 'ckIbus', 'ckDuty'] },
+  ckZc: { label: 'ZC Debug', channels: ['ckGoodZc', 'ckMissed', 'ckForced', 'ckFilterLevel'] },
+  ckSpeed: { label: 'Speed', channels: ['ckErpm', 'ckStepPeriod', 'ckDuty'] },
+};
+
+const CHANNELS: ScopeChannel[] = [
+  // FOC currents
+  { key: 'focIq', label: 'Iq (torque)', unit: 'A', color: '#eab308', group: 'FOC Current',
+    extract: (s) => +s.focIqMeas.toFixed(3), focOnly: true },
+  { key: 'focId', label: 'Id (field)', unit: 'A', color: '#22c55e', group: 'FOC Current',
+    extract: (s) => +s.focIdMeas.toFixed(3), focOnly: true },
+  { key: 'focIa', label: 'Phase Ia', unit: 'A', color: '#a78bfa', group: 'FOC Current',
+    extract: (s) => +s.focIa.toFixed(3), focOnly: true },
+  { key: 'focIb', label: 'Phase Ib', unit: 'A', color: '#c084fc', group: 'FOC Current',
+    extract: (s) => +s.focIb.toFixed(3), focOnly: true },
+
+  // FOC angles & speed
+  { key: 'focTheta', label: 'Drive Theta', unit: 'deg', color: '#22d3ee', group: 'FOC Angle',
+    extract: (s) => +(s.focTheta * 180 / Math.PI).toFixed(1), focOnly: true },
+  { key: 'focThetaObs', label: 'Observer Theta', unit: 'deg', color: '#06b6d4', group: 'FOC Angle',
+    extract: (s) => +(s.focThetaObs * 180 / Math.PI).toFixed(1), focOnly: true },
+  { key: 'focOmega', label: 'Speed (elec)', unit: 'rad/s', color: '#3b82f6', group: 'FOC Angle',
+    extract: (s) => +s.focOmega.toFixed(1), focOnly: true },
+  { key: 'focRpm', label: 'Speed (mech)', unit: 'RPM', color: '#60a5fa', group: 'FOC Angle',
+    extract: (s, i) => s.focOmega !== 0 ? Math.round(Math.abs(s.focOmega) * 60 / (2 * Math.PI * i.polePairs)) : 0, focOnly: true },
+  { key: 'focERPM', label: 'eRPM', unit: 'eRPM', color: '#2563eb', group: 'FOC Angle',
+    extract: (s) => s.focOmega !== 0 ? Math.round(Math.abs(s.focOmega) * 60 / (2 * Math.PI)) : 0, focOnly: true },
+  { key: 'focThetaError', label: 'θ Drive − θ Obs', unit: 'deg', color: '#fb7185', group: 'FOC Angle',
+    extract: (s) => {
+      let d = (s.focTheta - s.focThetaObs) * 180 / Math.PI;
+      while (d > 180) d -= 360;
+      while (d < -180) d += 360;
+      return +d.toFixed(2);
+    }, focOnly: true },
+
+  // FOC voltage
+  { key: 'focVq', label: 'Vq (torque)', unit: 'V', color: '#fb923c', group: 'FOC Voltage',
+    extract: (s) => +s.focVq.toFixed(3), focOnly: true },
+  { key: 'focVd', label: 'Vd (field)', unit: 'V', color: '#a3e635', group: 'FOC Voltage',
+    extract: (s) => +s.focVd.toFixed(3), focOnly: true },
+
+  // FOC power
+  { key: 'focVbus', label: 'Vbus (float)', unit: 'V', color: '#22c55e', group: 'FOC Power',
+    extract: (s) => +s.focVbus.toFixed(2), focOnly: true },
+  { key: 'focPower', label: 'Elec Power', unit: 'W', color: '#f97316', group: 'FOC Power',
+    extract: (s) => +(s.focVq * s.focIqMeas + s.focVd * s.focIdMeas).toFixed(1), focOnly: true },
+
+  // FOC observer internals
+  { key: 'focFluxAlpha', label: 'Flux Alpha', unit: 'V·s', color: '#14b8a6', group: 'FOC Observer',
+    extract: (s) => +s.focFluxAlpha.toFixed(5), focOnly: true },
+  { key: 'focFluxBeta', label: 'Flux Beta', unit: 'V·s', color: '#0d9488', group: 'FOC Observer',
+    extract: (s) => +s.focFluxBeta.toFixed(5), focOnly: true },
+  { key: 'focLambdaEst', label: 'Lambda Est', unit: 'V·s/rad', color: '#f59e0b', group: 'FOC Observer',
+    extract: (s) => +s.focLambdaEst.toFixed(6), focOnly: true },
+  { key: 'focObsGain', label: 'Obs Gain', unit: '', color: '#78716c', group: 'FOC Observer',
+    extract: (s) => +s.focObsGain.toFixed(4), focOnly: true },
+  { key: 'focObsConfidence', label: 'Obs Confidence', unit: '', color: '#10b981', group: 'FOC Observer',
+    extract: (s) => +s.focObsConfidence.toFixed(3), focOnly: true },
+  { key: 'focModIndex', label: 'Mod Index', unit: '', color: '#ef4444', group: 'FOC Observer',
+    extract: (s) => +s.focModIndex.toFixed(3), focOnly: true },
+
+  // FOC PI internals
+  { key: 'focPidDInteg', label: 'PI-D Integrator', unit: 'V', color: '#84cc16', group: 'FOC PI',
+    extract: (s) => +s.focPidDInteg.toFixed(3), focOnly: true },
+  { key: 'focPidQInteg', label: 'PI-Q Integrator', unit: 'V', color: '#eab308', group: 'FOC PI',
+    extract: (s) => +s.focPidQInteg.toFixed(3), focOnly: true },
+  { key: 'focPidSpdInteg', label: 'PI-Speed Integrator', unit: 'A', color: '#6366f1', group: 'FOC PI',
+    extract: (s) => +s.focPidSpdInteg.toFixed(3), focOnly: true },
+
+  // Motor (6-step)
+  { key: 'eRPM', label: 'eRPM', unit: 'eRPM', color: '#3b82f6', group: 'Motor',
+    extract: (s) => s.stepPeriod > 0 ? Math.round(240000 / s.stepPeriod) : 0, sixStepOnly: true },
+  { key: 'mechRPM', label: 'Mech RPM', unit: 'RPM', color: '#60a5fa', group: 'Motor',
+    extract: (s, i) => s.stepPeriod > 0 ? Math.round(240000 / s.stepPeriod / i.polePairs) : 0, sixStepOnly: true },
+  { key: 'duty', label: 'Duty', unit: '%', color: '#f472b6', group: 'Motor',
+    extract: (s) => s.dutyPct },
+  { key: 'throttle', label: 'Throttle', unit: '', color: '#c084fc', group: 'Motor',
+    extract: (s) => s.throttle },
+  { key: 'step', label: 'Comm Step', unit: '', color: '#94a3b8', group: 'Motor',
+    extract: (s) => s.currentStep, sixStepOnly: true },
+
+  // Power (bus)
+  { key: 'vbus', label: 'Vbus (ADC)', unit: 'V', color: '#22c55e', group: 'Power',
+    extract: (s) => +(s.vbusRaw * 3.3 / 4096 * 19.8).toFixed(2) },
+  { key: 'ibus', label: 'Ibus', unit: 'A', color: '#eab308', group: 'Power',
+    extract: (s) => +((s.ibusRaw - 2048) / 93.0).toFixed(3) },
+  { key: 'ibusMax', label: 'Ibus Peak', unit: 'A', color: '#f97316', group: 'Power',
+    extract: (s) => +((s.ibusMax - 2048) / 93.0).toFixed(3) },
+
+  // BEMF & ZC (6-step)
+  { key: 'bemf', label: 'BEMF Raw', unit: 'ADC', color: '#a78bfa', group: 'BEMF & ZC',
+    extract: (s) => s.bemfRaw, sixStepOnly: true },
+  { key: 'zcThreshold', label: 'ZC Threshold', unit: 'ADC', color: '#fb923c', group: 'BEMF & ZC',
+    extract: (s) => s.zcThreshold, sixStepOnly: true },
+  { key: 'goodZc', label: 'Good ZC Count', unit: '', color: '#22d3ee', group: 'BEMF & ZC',
+    extract: (s) => s.goodZcCount, sixStepOnly: true },
+  { key: 'zcConfirmed', label: 'ZC Confirmed', unit: '', color: '#2dd4bf', group: 'BEMF & ZC',
+    extract: (s) => s.zcConfirmedCount, sixStepOnly: true },
+  { key: 'zcForced', label: 'ZC Forced Steps', unit: '', color: '#f43f5e', group: 'BEMF & ZC',
+    extract: (s) => s.zcTimeoutForceCount, sixStepOnly: true },
+  { key: 'stepPeriod', label: 'Step Period', unit: 'ticks', color: '#64748b', group: 'BEMF & ZC',
+    extract: (s) => s.stepPeriod, sixStepOnly: true },
+
+  // HWZC (6-step)
+  { key: 'hwzcZcCount', label: 'HWZC Total ZC', unit: '', color: '#06b6d4', group: 'HWZC',
+    extract: (s) => s.hwzcTotalZcCount, sixStepOnly: true },
+  { key: 'hwzcMissCount', label: 'HWZC Misses', unit: '', color: '#ef4444', group: 'HWZC',
+    extract: (s) => s.hwzcTotalMissCount, sixStepOnly: true },
+  { key: 'hwzcStepPeriod', label: 'HWZC Step Period', unit: 'ticks', color: '#8b5cf6', group: 'HWZC',
+    extract: (s) => s.hwzcStepPeriodHR, sixStepOnly: true },
+
+  // Morph (6-step)
+  { key: 'morphAlpha', label: 'Morph Alpha', unit: '', color: '#d946ef', group: 'Morph',
+    extract: (s) => s.morphAlpha, sixStepOnly: true },
+  { key: 'morphZcCount', label: 'Morph ZC Count', unit: '', color: '#e879f9', group: 'Morph',
+    extract: (s) => s.morphZcCount, sixStepOnly: true },
+
+  // Protection
+  { key: 'clpciTrips', label: 'CLPCI Trips', unit: '', color: '#dc2626', group: 'Protection',
+    extract: (s) => s.clpciTripCount },
+  { key: 'fpciTrips', label: 'FPCI Trips', unit: '', color: '#b91c1c', group: 'Protection',
+    extract: (s) => s.fpciTripCount },
+];
+
+const PRESETS: Record<string, { label: string; channels: string[]; focOnly?: boolean; sixStepOnly?: boolean }> = {
+  focDebug: { label: 'FOC Debug', channels: ['focIq', 'focId', 'focOmega', 'duty'], focOnly: true },
+  focCurrent: { label: 'FOC Currents', channels: ['focIq', 'focId', 'focIa', 'focIb'], focOnly: true },
+  focAngle: { label: 'FOC Angles', channels: ['focTheta', 'focThetaObs', 'focOmega'], focOnly: true },
+  focVoltage: { label: 'FOC Voltage', channels: ['focVq', 'focVd', 'focVbus'], focOnly: true },
+  focPower: { label: 'FOC Power', channels: ['focVbus', 'focPower', 'focIq'], focOnly: true },
+  focObserver: { label: 'FOC Observer', channels: ['focObsConfidence', 'focModIndex', 'focLambdaEst', 'focObsGain'], focOnly: true },
+  focPI: { label: 'FOC PI State', channels: ['focPidDInteg', 'focPidQInteg', 'focPidSpdInteg'], focOnly: true },
+  /* AN1078 SMO tuning preset — for sensorless FOC observer health check.
+   *
+   * Watch:
+   *   focVd: should stay near 0 across the speed range — non-zero Vd means
+   *          observer angle is offset (tune AN_SMC_THETA_OFFSET_BASE
+   *          and/or AN_SMC_THETA_OFFSET_K).  Sustained -V means observer
+   *          lags; sustained +V means observer leads.
+   *   focVq: ≈ ω·λ + R·Iq — climbs with speed, this is BEMF.
+   *   focIq: torque current.  Should be small at no-load, larger under load.
+   *   focId: should be ~0 except during field weakening at high speed.
+   *   focERPM: scrubbed-to-actual eRPM (focOmega-based, NOT stepPeriod).
+   *   focModIndex: voltage utilization.  ≥0.93 → field weakening engages. */
+  an1078SmoTune: { label: 'AN1078 SMO Tune', channels: ['focVd', 'focVq', 'focIq', 'focId', 'focERPM', 'focModIndex'], focOnly: true },
+  an1078Angle: { label: 'AN1078 Angle Health', channels: ['focTheta', 'focThetaObs', 'focThetaError', 'focERPM'], focOnly: true },
+  sixStep: { label: '6-Step', channels: ['eRPM', 'duty', 'bemf', 'zcThreshold'], sixStepOnly: true },
+  power: { label: 'Power', channels: ['vbus', 'ibus', 'ibusMax', 'duty'] },
+};
+
+export function ScopePanel() {
+  const akHistory = useEscStore(s => s.history);
+  const ckHistory = useEscStore(s => s.ckHistory);
+  const info = useEscStore(s => s.info);
+  const telemActive = useEscStore(s => s.telemActive);
+  const focMode = info ? isFocEnabled(info.featureFlags) : false;
+  const ckMode = info ? isCkBoard(info.boardId) : false;
+
+  const [activeChannels, setActiveChannels] = useState<Set<string>>(
+    new Set(['eRPM', 'duty', 'bemf', 'zcThreshold'])
+  );
+  const [expanded, setExpanded] = useState(true);
+  const prevFocMode = useRef(focMode);
+  const prevCkMode = useRef(ckMode);
+
+  // Auto-switch default channels when mode/board changes
+  useEffect(() => {
+    if (ckMode !== prevCkMode.current) {
+      prevCkMode.current = ckMode;
+      if (ckMode) {
+        setActiveChannels(new Set(['ckErpm', 'ckDuty', 'ckVbus', 'ckIbus']));
+        return;
+      }
+    }
+    if (focMode !== prevFocMode.current) {
+      prevFocMode.current = focMode;
+      setActiveChannels(focMode
+        ? new Set(['focIq', 'focId', 'focOmega', 'duty'])
+        : new Set(['eRPM', 'duty', 'bemf', 'zcThreshold'])
+      );
+    }
+  }, [focMode, ckMode]);
+
+  const polePairs = info?.motorPolePairs ?? 1;
+
+  // CK board: use CK channels and history
+  const visibleChannels = ckMode
+    ? (CK_CHANNELS as unknown as ScopeChannel[])
+    : CHANNELS.filter(ch => {
+        if (focMode && ch.sixStepOnly) return false;
+        if (!focMode && ch.focOnly) return false;
+        return true;
+      });
+
+  const visiblePresets = ckMode
+    ? Object.entries(CK_PRESETS)
+    : Object.entries(PRESETS).filter(([, p]) => {
+        if (focMode && p.sixStepOnly) return false;
+        if (!focMode && p.focOnly) return false;
+        return true;
+      });
+
+  const history = ckMode ? ckHistory : akHistory;
+
+  const toggle = (key: string) => {
+    setActiveChannels(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const applyPreset = (channels: string[]) => {
+    setActiveChannels(new Set(channels));
+  };
+
+  const activeChList = useMemo(
+    () => visibleChannels.filter(ch => activeChannels.has(ch.key)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeChannels, focMode, polePairs]
+  );
+
+  const data = useMemo(() => {
+    return (history as any[]).map((s: any, i: number) => {
+      const point: Record<string, number> = { t: +(i * 0.02).toFixed(2) };
+      for (const ch of activeChList) {
+        const v = ch.extract(s, { polePairs });
+        point[ch.key] = Number.isFinite(v) ? v : 0;
+      }
+      return point;
+    });
+  }, [history, activeChList, polePairs]);
+
+  const activeList = activeChList;
+
+  // Axis assignment
+  const leftKeys = ckMode
+    ? ['ckErpm', 'ckMechRpm', 'ckVbus', 'ckStepPeriod', 'ckIa', 'ckIb', 'ckIbus']
+    : focMode
+      ? ['focOmega', 'focRpm', 'focVbus', 'focPower', 'focTheta', 'focThetaObs']
+      : ['eRPM', 'mechRPM', 'stepPeriod', 'hwzcStepPeriod', 'bemf', 'zcThreshold'];
+  const rightKeys = ckMode
+    ? ['ckDuty', 'ckPot', 'ckFilterLevel']
+    : ['duty', 'throttle', 'morphAlpha'];
+
+  const leftChannels = activeList.filter(c => leftKeys.includes(c.key));
+  const rightChannels = activeList.filter(c => rightKeys.includes(c.key));
+  const extraChannels = activeList.filter(c => !leftKeys.includes(c.key) && !rightKeys.includes(c.key));
+
+  // Group channel selector
+  const groups = new Map<string, ScopeChannel[]>();
+  for (const ch of visibleChannels) {
+    const list = groups.get(ch.group) || [];
+    list.push(ch);
+    groups.set(ch.group, list);
+  }
+
+  return (
+    <div style={{
+      background: 'var(--bg-card)', borderRadius: 'var(--radius)',
+      padding: 16, border: '1px solid var(--border)',
+    }}>
+      {/* Header */}
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        marginBottom: expanded ? 12 : 0,
+      }}>
+        <button
+          onClick={() => setExpanded(!expanded)}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 8,
+            background: 'none', border: 'none', color: 'var(--text-primary)',
+            fontSize: 13, fontWeight: 600, padding: 0,
+          }}
+        >
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"
+            style={{ transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.2s' }}>
+            <path d="M5 3L9 7L5 11" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+          </svg>
+          <span style={{ textTransform: 'uppercase', letterSpacing: '1px', color: 'var(--text-muted)' }}>
+            Live Scope
+          </span>
+        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          {/* Presets */}
+          {visiblePresets.map(([key, preset]) => (
+            <button key={key} onClick={() => applyPreset(preset.channels)} style={{
+              padding: '2px 8px', borderRadius: 3, fontSize: 9, fontWeight: 600,
+              border: '1px solid var(--border)', background: 'transparent',
+              color: 'var(--text-muted)', cursor: 'pointer', textTransform: 'uppercase',
+              letterSpacing: '0.3px',
+            }}>
+              {preset.label}
+            </button>
+          ))}
+          {telemActive && (
+            <span style={{
+              fontSize: 10, color: 'var(--accent-green)', fontWeight: 600,
+              display: 'flex', alignItems: 'center', gap: 4,
+            }}>
+              <span style={{
+                width: 6, height: 6, borderRadius: '50%',
+                background: 'var(--accent-green)', animation: 'pulse 1.5s infinite',
+              }} />
+              LIVE
+            </span>
+          )}
+          <span style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+            {activeList.length} ch / {history.length} pts
+          </span>
+        </div>
+      </div>
+
+      {expanded && (
+        <>
+          {/* Channel selector */}
+          <div style={{
+            display: 'flex', flexWrap: 'wrap', gap: 12, marginBottom: 12,
+            padding: '10px 12px', background: 'var(--bg-secondary)',
+            borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-light)',
+          }}>
+            {[...groups.entries()].map(([groupName, channels]) => (
+              <div key={groupName} style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                <span style={{ fontSize: 9, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                  {groupName}
+                </span>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3 }}>
+                  {channels.map(ch => {
+                    const active = activeChannels.has(ch.key);
+                    return (
+                      <button key={ch.key} onClick={() => toggle(ch.key)} style={{
+                        padding: '2px 8px', borderRadius: 3, fontSize: 10, fontWeight: 500,
+                        border: `1px solid ${active ? ch.color : 'var(--border)'}`,
+                        background: active ? `${ch.color}22` : 'transparent',
+                        color: active ? ch.color : 'var(--text-muted)',
+                        cursor: 'pointer', whiteSpace: 'nowrap',
+                        transition: 'all 0.15s',
+                      }}>
+                        {ch.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* Chart */}
+          {activeList.length === 0 ? (
+            <div style={{
+              height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center',
+              color: 'var(--text-muted)', fontSize: 13,
+            }}>
+              Select channels above to display
+            </div>
+          ) : (
+            <ResponsiveContainer width="100%" height={320}>
+              <LineChart data={data} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--border-light)" />
+                <XAxis
+                  dataKey="t"
+                  tick={{ fill: 'var(--text-muted)', fontSize: 9 }}
+                  label={{ value: 'Time (s)', position: 'insideBottomRight', offset: -4, fill: 'var(--text-muted)', fontSize: 9 }}
+                />
+
+                {leftChannels.length > 0 && (
+                  <YAxis
+                    yAxisId="left"
+                    tick={{ fill: leftChannels[0].color, fontSize: 9 }}
+                    width={55}
+                  />
+                )}
+
+                {rightChannels.length > 0 && (
+                  <YAxis
+                    yAxisId="right" orientation="right"
+                    domain={[0, rightChannels.some(c => c.key === 'throttle') ? 2000 : 100]}
+                    tick={{ fill: rightChannels[0].color, fontSize: 9 }}
+                    width={40}
+                  />
+                )}
+
+                {extraChannels.length > 0 && (
+                  <YAxis yAxisId="extra" hide />
+                )}
+
+                <Tooltip
+                  contentStyle={{
+                    background: 'var(--bg-secondary)', border: '1px solid var(--border)',
+                    borderRadius: 'var(--radius-sm)', fontSize: 10,
+                    fontFamily: 'var(--font-mono)',
+                  }}
+                  formatter={(value: number, name: string) => {
+                    const ch = visibleChannels.find(c => c.key === name);
+                    return [`${typeof value === 'number' ? value.toFixed(2) : value} ${ch?.unit ?? ''}`, ch?.label ?? name];
+                  }}
+                />
+                <Legend wrapperStyle={{ fontSize: 10, paddingTop: 4 }} />
+
+                {activeList.map(ch => {
+                  let yAxisId = 'extra';
+                  if (leftKeys.includes(ch.key)) yAxisId = 'left';
+                  else if (rightKeys.includes(ch.key)) yAxisId = 'right';
+
+                  return (
+                    <Line
+                      key={ch.key}
+                      yAxisId={yAxisId}
+                      type="monotone"
+                      dataKey={ch.key}
+                      name={ch.key}
+                      stroke={ch.color}
+                      strokeWidth={1.5}
+                      dot={false}
+                      isAnimationActive={false}
+                    />
+                  );
+                })}
+              </LineChart>
+            </ResponsiveContainer>
+          )}
+
+          {/* Current values readout */}
+          {activeList.length > 0 && history.length > 0 && (
+            <div style={{
+              display: 'flex', flexWrap: 'wrap', gap: 12, marginTop: 8,
+              padding: '8px 12px', background: 'var(--bg-secondary)',
+              borderRadius: 'var(--radius-sm)',
+            }}>
+              {activeList.map(ch => {
+                const lastSnap = history[history.length - 1];
+                const val = ch.extract(lastSnap, { polePairs });
+                return (
+                  <div key={ch.key} style={{ display: 'flex', alignItems: 'baseline', gap: 4 }}>
+                    <span style={{
+                      width: 8, height: 8, borderRadius: 2,
+                      background: ch.color, display: 'inline-block', flexShrink: 0,
+                    }} />
+                    <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{ch.label}:</span>
+                    <span style={{ fontSize: 11, fontWeight: 600, fontFamily: 'var(--font-mono)', color: ch.color }}>
+                      {typeof val === 'number' ? (Number.isInteger(val) ? val : val.toFixed(2)) : val}
+                    </span>
+                    <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>{ch.unit}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}

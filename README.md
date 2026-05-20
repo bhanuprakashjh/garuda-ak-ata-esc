@@ -1,11 +1,19 @@
 # garuda-ak-ata-esc
 
-6-step trapezoidal sensorless BLDC ESC firmware for the
-**dsPIC33AK128MC106 + ATA6847L** on the Microchip **EV43F54A**
-evaluation board.
+Sensorless BLDC ESC firmware for the **dsPIC33AK128MC106 + ATA6847L** on
+the Microchip **EV43F54A** evaluation board. Two control paths share one
+codebase, selected by a single compile-time flag:
 
-> Bench-verified to **225 k eRPM** on a bare 2810 outrunner @ 24 V
-> (Profile 2). Block-commutation engages cleanly above ~210 k.
+| Mode | `FEATURE_FOC_AN1078` | What it is | Bench peak (24 V, 2810) |
+|---|---|---|---|
+| **6-step trapezoidal** | `0` (default) | sector_pi + BEMF ZC + block commutation | **225 k eRPM** |
+| **AN1078 SMO FOC** | `1` | sliding-mode observer + d/q PI + SVPWM | **211 k eRPM** |
+
+Both modes share the same hardware init, GSP binary protocol, and the
+React/Vite GUI in [`gui/`](gui/). The GUI auto-detects which mode the
+firmware is running and routes to the appropriate dashboard. See
+[`docs/ak_an1078_foc_port.md`](docs/ak_an1078_foc_port.md) for the FOC
+port architecture, snapshot layout, and bring-up history.
 
 ---
 
