@@ -1,6 +1,6 @@
 /**
  * @file hal_pwm.h
- * @brief PWM HAL for dsPIC33CK 6-step commutation.
+ * @brief PWM HAL for dsPIC33AK 6-step commutation.
  */
 #ifndef HAL_PWM_H
 #define HAL_PWM_H
@@ -31,27 +31,5 @@ extern volatile bool g_blockCommActive;
 void     HAL_PWM_ChargeBootstrap(void);
 void     HAL_PWM_ForceAllFloat(void);
 void     HAL_PWM_ForceAllLow(void);
-
-/* Single-pulse mode: above SP_ENTER_ERPM, PWM period = sector period.
- * No switching edges mid-sector → clean BEMF for comparator.
- * amplitude controls on-time fraction within the sector. */
-void     HAL_PWM_SetSinglePulse(uint16_t sectorPeriodTCY, uint32_t duty);
-void     HAL_PWM_ExitSinglePulse(void);
-bool     HAL_PWM_IsSinglePulse(void);
-void     HAL_PWM_SetSPFlag(bool on);
-
-/* SP mode dormant — set above any reachable eRPM so SP never engages.
- * SP machinery (unipolar switch, actualStepPeriodHR, PI freeze, dynamic
- * blanking, CCP capture path) is preserved in the codebase for future
- * work. Pivoted to lower PWM carrier (20 kHz) instead — gives cleaner
- * BEMF at high speed without SP's hardware-coupling issues.
- *
- * [AK PORT] Bumped to 999999 per plan v6 §1 "SP out of scope for
- * milestone". SP would bypass the ADC-midpoint ZC path while CCP
- * diagnostics are off (FEATURE_V4_CCP_DIAG=0), leaving the motor
- * without a ZC source.  To re-enable SP after CCP path is ported,
- * lower threshold to 70000UL / 55000UL. */
-#define SP_ENTER_ERPM   999999UL
-#define SP_EXIT_ERPM    900000UL
 
 #endif

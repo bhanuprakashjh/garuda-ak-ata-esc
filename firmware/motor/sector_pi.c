@@ -1,6 +1,6 @@
 /**
  * @file sector_pi.c
- * @brief V4 Sector PI motor control.
+ * @brief Sector PI motor control.
  *
  * Startup: V3-style Timer1 countdown for ALIGN + OL_RAMP (proven).
  * Closed-loop: AVR-style PI synchronizer on SCCP3 + CCP2 capture.
@@ -12,56 +12,33 @@
 
 #include "sector_pi.h"
 
-#if FEATURE_V4_SECTOR_PI
 
 #include <xc.h>
 #include "../garuda_config.h"
 #include "../hal/hal_ak_compat.h"
 #include "../hal/hal_pwm.h"
 #include "../hal/hal_com_timer.h"
-#include "../hal/hal_capture.h"
 #include "../hal/hal_ptg.h"
 #include "../hal/port_config.h"
 #include "commutation.h"
-#include "v4_params.h"
-
-/* [AK PORT] dsPIC33AK has only SCCP1-4 — no SCCP5. The V4 sector PI
- * does defensive CCP housekeeping (clear-IF, drain-FIFO, mask-IE) even
- * though the milestone runs on ADC-ISR midpoint sampling. When
- * FEATURE_V4_CCP_DIAG=0 (default on AK), provide dummy SFR shims so
- * the housekeeping compiles to no-ops. SCCP3 takes over the role on
- * AK once FEATURE_V4_CCP_DIAG is wired up. */
-#if !FEATURE_V4_CCP_DIAG
-static volatile uint8_t  v4_dummy_CCP5IE_bit;
-static volatile uint8_t  v4_dummy_CCP5IF_bit;
-typedef struct { unsigned ICBNE : 1; } v4_dummy_CCP5STATbits_t;
-static volatile v4_dummy_CCP5STATbits_t v4_dummy_CCP5STATbits;
-static volatile uint16_t v4_dummy_CCP5BUF;
-#define _CCP5IE        v4_dummy_CCP5IE_bit
-#define _CCP5IF        v4_dummy_CCP5IF_bit
-#define CCP5STATbits  v4_dummy_CCP5STATbits
-#define CCP5BUF       v4_dummy_CCP5BUF
-#endif
+#include "motor_params.h"
 
 /* ── Sentinel for "no comparator edge this sector" ──────────────── */
 #define CAP_SENTINEL    0xFFFFU
 
-/* ── PPS lookup: floatingPhase index → RP pin number ────────────── */
-static const uint8_t bemfRpPin[3] = {
-    (uint8_t)BEMF_A_RP,
-    (uint8_t)BEMF_B_RP,
-    (uint8_t)BEMF_C_RP
-};
+/* Latest accepted BEMF capture — see sector_pi.h. */
+volatile uint16_t lastCaptureHR_g = 0;
+volatile bool     captureValid    = false;
 
 /* ── State ──────────────────────────────────────────────────────── */
 typedef enum {
-    V4_OFF = 0,
-    V4_ALIGN,
-    V4_OL_RAMP,
-    V4_CLOSED_LOOP
-} V4_PHASE_T;
+    SECTOR_PHASE_OFF = 0,
+    SECTOR_PHASE_ALIGN,
+    SECTOR_PHASE_OL_RAMP,
+    SECTOR_PHASE_CL
+} SECTOR_PHASE_T;
 
-static volatile V4_PHASE_T phase;
+static volatile SECTOR_PHASE_T phase;
 static          uint8_t    position;        /* 0..5 */
 static volatile bool       running;
 static volatile uint16_t   statusEvents;
@@ -72,25 +49,33 @@ static volatile uint32_t   sectorCount;
  * shows odd sectors" anomaly: if hits[0,2,4] stay at 0 while [1,3,5]
  * climb, position is incrementing by 2 somewhere and rising-sector
  * BEMF detection literally never runs. Exposed via GSP snapshot tail. */
-volatile uint32_t v4_sectorHits[6] = {0,0,0,0,0,0};
+volatile uint32_t sectorHits[6] = {0,0,0,0,0,0};
 
 /* Per-sector current position mirror — written from both Commutate paths
- * to give the PTG/V4_ProcessBemfSample probe a sector index without
+ * to give the PTG/ProcessBemfSample probe a sector index without
  * exposing the static `position`. Read-only outside sector_pi.c. */
-volatile uint8_t v4_currentSector = 0;
+volatile uint8_t currentSector = 0;
+
+/* Atomic per-sector snapshot read by the PTG ISR. Packs the same three
+ * fields written individually below (currentSector, floatingPhase,
+ * ptgExpectedComp) into a single uint16 so PTG can read them with one
+ * 16-bit load and avoid a torn snapshot if Commutate (IPL 6) preempts
+ * mid-read. Layout — see SECTOR_SNAP_* helpers in sector_pi.h:
+ *   bits 0..2 = currentSector (0..5)
+ *   bits 3..4 = floatingPhase (0..2)
+ *   bit  5    = ptgExpectedComp (0..1) */
+volatile uint16_t sectorSnap = 0;
 
 /* ── OL ramp state (Timer1 driven, matches V3 startup.c) ───────── */
 static volatile uint16_t   alignCounter;
 static volatile uint16_t   rampStepPeriod;  /* Timer1 ticks per step */
 static volatile uint16_t   rampCounter;     /* Timer1 countdown */
 static volatile uint32_t   rampDuty;
-/* OL handoff settle: after rampStepPeriod reaches MIN_STEP_PERIOD,
- * hold the motor at that forced rate for OL_HANDOFF_SETTLE_TICKS
- * Timer1 ticks (50µs each) before EnterCL. Lets the rotor physically
- * catch up to the commanded rate. Diagnosed 2026-05-12 on AK board:
- * without settle, rotor lags commanded speed, BEMF stuck on the wrong
- * side of neutral all sector, V5_POST_ZC_OWN edge gate never triggers,
- * stall in 1s. */
+/* OL handoff settle: after rampStepPeriod reaches MIN_STEP_PERIOD, hold
+ * the motor at the forced rate for OL_HANDOFF_SETTLE_TICKS Timer1 ticks
+ * (50µs each) before EnterCL. Without this, the rotor lags commanded
+ * speed at handoff → BEMF stays on the wrong side of neutral all
+ * sector → post-ZC edge gate never triggers → stall. */
 #ifndef OL_HANDOFF_SETTLE_MS
 #define OL_HANDOFF_SETTLE_MS  200U
 #endif
@@ -100,43 +85,26 @@ static volatile uint16_t   olHandoffCounter;
 
 /* ── PI state (SCCP3 driven, active in CL only) ────────────────── */
 static volatile uint16_t   timerPeriod;     /* sector period (PI output) */
-volatile uint16_t v4_timerPeriod;           /* exposed for CCP ISR speed check */
+volatile uint16_t timerPeriod_g;           /* exposed for CCP ISR speed check */
 static volatile uint16_t   integrator;
 /* PI integrator floor — set in EnterCL() to the OL handoff seed value.
- * The PI cannot drive timerPeriod below this until commandEnabled goes
- * true (= rotor has had CL_SETTLE_MS to lock). Reason: sparse rising
- * captures during early CL almost always come back as capValue<setValue
- * (rotor lags the table-forced commutation rate). The PI interprets
- * that as "rotor is ahead" and shrinks timerPeriod → commutation fires
- * faster → rotor falls further behind → death spiral. CK doesn't see
- * this because its rotor stays locked at handoff. AK does (2026-05-12
- * trace: Tp walked 3906→2964 in 1s with rising-only feed). Floor lifts
- * after settle, letting the PI track high-speed truth normally. */
+ * Until commandEnabled goes true (rotor has had CL_SETTLE_MS to lock),
+ * the PI cannot drive timerPeriod below the seed. Reason: early-CL
+ * captures arrive with capValue<setValue (rotor lags forced commutation
+ * rate). The PI reads that as "rotor is ahead" → shrinks timerPeriod →
+ * commutates faster → rotor falls further behind → death spiral. The
+ * floor blocks this until the loop has settled. */
 static volatile uint16_t   seedIntegrator;
 static          uint8_t    stallCounter;
 static volatile bool       commandEnabled;
-/* SP mode flags.
- *   v4_spRequest: set in TimeTick based on eRPM threshold + hysteresis.
- *   v4_spActive : set in Commutate ISR when transition is actually applied
- *                 (MPER write + capture flush). Read by CCP ISRs in
- *                 garuda_service.c to switch ZC source from ADC midpoint
- *                 (invalid when MPER=0xFFFF) to hardware comparator IC.
- *                 Decoupling prevents mid-sector MPER changes that can
- *                 drop the transition sector's ZC. */
-static volatile bool       v4_spRequest = false;
-volatile bool              v4_spActive  = false;
-
-/* ── Single-pulse mode: effective PWM period for duty scaling ─ */
-/* HR tick = 640ns = 128 PWM ticks (Fosc/2=200MHz, 5ns/tick).   */
-/* SP mode: per = timerPeriod << 7 (pulse width = amp × per).    */
-/* Normal:  per = LOOPTIME_TCY (fixed 40kHz).                    */
 /* Updated in Commutate ISR; exposed for telemetry.              */
 volatile uint16_t g_pwmPer = LOOPTIME_TCY;
 static volatile uint16_t   actualAmplitude;
 static volatile uint16_t   targetAmplitude;
 static volatile uint16_t   targetPeriod;    /* pot-commanded speed */
 static volatile uint16_t   basePeriod;      /* ramped toward targetPeriod */
-static volatile uint16_t   lastCommHR;      /* HR time of last commutation */
+volatile uint16_t          lastCommHR;      /* HR time of last commutation
+                                             * (extern in sector_pi.h for HWZC). */
 static volatile uint16_t   actualStepPeriodHR; /* measured comm-to-comm HR */
 
 /* ── Speed measurement ──────────────────────────────────────────── */
@@ -151,58 +119,15 @@ static volatile uint16_t   measuredSpeed;
 #define CL_SETTLE_MS  500U
 static volatile uint16_t clSettleCounter = 0;
 
-/* V5.2 measurement-based period tracker.
- *   v5_tMeasHR       — raw halved measuredCommPeriod, written by Commutate ISR.
- *                       Fast path: single write, no branches. Noisy.
- *   v5_tMeasHRSmooth — spike-filtered + EMA smoothed, written by TimeTick
- *                       (1 ms rate where cycles are cheap). Clean value
- *                       shipped in telemetry and used by MEAS_PI_OWN.
- * Both defined unconditionally so telemetry works with flag off. */
-volatile uint16_t v5_tMeasHR       = 0;
-volatile uint16_t v5_tMeasHRSmooth = 0;
-
-/* ── V5.3 scheduler state ───────────────────────────────────────
- * Used only when FEATURE_V5_SCHEDULER=1. Defined unconditionally so
- * telemetry and tooling can reference fields without flag gating.
- *
- * sched_prevCaptureHR / sched_thisCaptureHR:
- *   Capture timestamps from the last two ZC events (either CCP2
- *   rising or CCP5 falling). T_sector = this - prev. Unlike V4's
- *   measuredCommPeriod (Commutate-to-Commutate, which reads 2×
- *   because of ASAP pair firing), this is 1 physical sector.
- *
- * sched_Tsector:
- *   Raw per-sector period in HR ticks. Updated on each new
- *   capture. No EMA here — the scheduler uses this directly.
- *
- * sched_captureSource:
- *   0 = last capture was from rising (CCP2)
- *   1 = last capture was from falling (CCP5)
- *   Used to sanity-check that captures alternate (rising-falling).
- *
- * sched_diag* counters:
- *   Accepted captures per polarity, schedule misses, etc. */
-volatile uint16_t sched_prevCaptureHR   = 0;
-volatile uint16_t sched_thisCaptureHR   = 0;
-volatile uint16_t sched_Tsector         = 0;
-volatile uint8_t  sched_captureSource   = 0;
-volatile bool     sched_firstCapture    = true;   /* true after EnterCL */
-volatile uint32_t sched_diagRisingAcc   = 0;
-volatile uint32_t sched_diagFallingAcc  = 0;
-volatile uint32_t sched_diagImplausible = 0;    /* dt outside [T/2, 1.5T] */
-volatile uint32_t sched_diagScheduleLate = 0;   /* target was past */
-volatile uint32_t sched_diagScheduleOk  = 0;    /* target was future */
-
-/* ── Speed regulation (outer loop) ─────────────────────────────── */
-/* pot → targetSpeed, PI on (targetSpeed - measuredSpeed) → amplitude.
- * This is the AVR's __Speed_Control. Runs at 1ms in TimeTick.
- * Separate from the sector PI (inner loop) which tracks ZC phase. */
-static volatile uint16_t   targetSpeed;     /* in measuredSpeed units */
-static volatile int32_t    speedIntegrator; /* fixp16 amplitude integrator */
-#define SPEED_KP            1U              /* proportional gain */
-#define SPEED_KI_DT         3U              /* Ki * dt (integral step) */
-#define SPEED_MIN_RPM       4000UL          /* minimum target eRPM */
-#define SPEED_MAX_RPM       100000UL        /* maximum target eRPM */
+/* Measurement-based period tracker.
+ *   tMeasHR       — raw halved measuredCommPeriod, written by Commutate ISR.
+ *                   Fast path: single write, no branches. Noisy.
+ *   tMeasHRSmooth — spike-filtered + EMA smoothed, written by TimeTick
+ *                   (1 kHz rate where cycles are cheap). Shipped in
+ *                   telemetry and used by MEAS_PI_OWN.
+ * Defined unconditionally so telemetry stays valid when MEAS_PI is off. */
+volatile uint16_t tMeasHR       = 0;
+volatile uint16_t tMeasHRSmooth = 0;
 
 /* ── Diagnostics ────────────────────────────────────────────────── */
 volatile uint16_t diagCaptures;
@@ -212,34 +137,33 @@ volatile int16_t  diagDelta;
 /* Commutate ISR: capValue == SENTINEL (no valid capture this sector) */
 volatile uint32_t diagCommutateNoCapture;
 
-/* 2026-05-14 instrumentation: per-polarity PI feed accounting.
- * Counted at the actual PI-feed point (after plausibility filter) so we
- * can see which sector type is actually contributing measurements vs
- * falling through to scheduler-only commutation. */
+/* Per-polarity PI-feed accounting. Counted at the PI-feed point (after
+ * plausibility filter) so the GUI can show which sector polarity is
+ * actually contributing captures vs falling through to scheduler-only. */
 volatile uint32_t diagPiFedRising   = 0;
 volatile uint32_t diagPiFedFalling  = 0;
 volatile uint32_t diagPiMissRising  = 0;  /* sector was rising, no PI feed */
 volatile uint32_t diagPiMissFalling = 0;  /* sector was falling, no PI feed */
 
-/* 2026-05-14 mechanism probe: per-polarity elapsed-snapshot. Snapshot the
- * last elapsed value and the contemporaneous filterHR at the accept point
- * AND the reject point, separately for rising and falling sectors. With
- * Phase 2 locked (cR≈208 frozen, cF≈309k growing), this tells us *why*
- * rising is being filtered:
- *   - If diagElapsedRejectRising ≈ diagFilterHRLast + small  → drift past
- *     window (rotor sector slightly longer than truth-based filterHR)
- *   - If diagElapsedRejectRising near 65535 / huge            → capture is
- *     stale (from prior sector, didn't get cleared)
- *   - If diagElapsedRejectRising ≈ 0..tiny                    → capture
- *     fired right at the commutate boundary, before this sector's BEMF
- * Pair-comparison with diagElapsedAcceptFalling answers: is the accepted
- * polarity's elapsed structurally smaller (within filter) while rejected
- * polarity's is structurally larger (past filter)? */
+/* Per-polarity elapsed snapshots for the GUI mechanism-probe. Used to
+ * diagnose why one polarity's captures get filtered out:
+ *   - rejectRising ≈ filterHRLast + small : sector ran slightly long
+ *   - rejectRising near 65535             : capture is stale (uncleared)
+ *   - rejectRising ≈ 0..tiny              : capture fired at the
+ *                                           commutate boundary, before
+ *                                           this sector's BEMF settled */
 volatile uint16_t diagElapsedAcceptRising  = 0;
 volatile uint16_t diagElapsedAcceptFalling = 0;
 volatile uint16_t diagElapsedRejectRising  = 0;
 volatile uint16_t diagElapsedRejectFalling = 0;
 volatile uint16_t diagFilterHRLast         = 0;
+
+/* Stage A — OL-ramp ZC observation diagnostics. Populated in
+ * SectorPI_OlTick on each OL commutation step. Telemetry only; no
+ * control change in Stage A. */
+volatile uint16_t olCapInCorridor    = 0;
+volatile uint16_t olCapOutOfCorridor = 0;
+volatile uint16_t olLastElapsedHR    = 0;
 
 /* Corridor good-streak: PI only runs after 12 consecutive
  * sectors with a valid corridor capture. */
@@ -260,12 +184,9 @@ static uint16_t blockCommStableTicks = 0;
  * that disturbs the BEMF measurement and can cascade into desync). */
 static uint16_t blockExitCooldown = 0;
 
-/* ── Diagnostic capture log (CL handoff investigation) ─────────────
- * Snapshots the first PI_LOG_ENTRIES PI iterations after CL entry so
- * we can see exactly what captures the PI was fed with — useful when
- * runaway or desync happens too fast for streamed telemetry to show.
- * Per entry: input timerPeriod, PI's setValue, raw capValue, clamped
- * delta. Frozen once full; re-armed by EnterCL. Read via GSP. */
+/* PI capture log — snapshots the first PI_LOG_ENTRIES iterations
+ * after CL entry. Frozen once full, re-armed by EnterCL, read via GSP.
+ * Used when runaway/desync happens too fast for streamed telemetry. */
 #define PI_LOG_ENTRIES   30U
 typedef struct __attribute__((packed)) {
     uint16_t timerPeriod;   /* before PI update */
@@ -291,28 +212,12 @@ static inline uint16_t FixpMulU16(uint16_t a, uint16_t b)
 
 static void ShutOff(void)
 {
-    HAL_Capture_Stop();
-    HAL_PTG_Stop();        /* V5.0 — no-op unless FEATURE_V5_PTG_ZC=1 */
+    HAL_PTG_Stop();
     HAL_ComTimer_Cancel();
-    /* Exit SP mode if active — restores MPER = LOOPTIME_TCY. Reset
-     * BOTH v4_spRequest and v4_spActive so the next start doesn't
-     * inherit a latched request from the previous run. */
-    if (v4_spActive)
-    {
-        MPER = LOOPTIME_TCY;
-        PG1TRIGA = 0x00000000UL;    /* CAHALF=0, TRIGA=0 — period boundary = MID-OFF (CK-equivalent) */
-        PG1STATbits.UPDREQ = 1;
-        PG2STATbits.UPDREQ = 1;
-        PG3STATbits.UPDREQ = 1;
-        g_pwmPer = LOOPTIME_TCY;
-    }
-    v4_spRequest = false;
-    v4_spActive = false;
-    HAL_PWM_SetSPFlag(false);
     HAL_PWM_ForceAllFloat();
     HAL_PWM_SetDutyCycle(0);
     running = false;
-    phase = V4_OFF;
+    phase = SECTOR_PHASE_OFF;
     commandEnabled = false;
     actualAmplitude = 0;
     position = 0;
@@ -328,8 +233,15 @@ static void EnterCL(void)
      * Convert Timer1 step period to SCCP3 ticks (640ns).
      * T1 tick = 50µs = 78.125 SCCP ticks. */
     uint32_t hrPeriod = (uint32_t)rampStepPeriod * 625UL / 8UL;
-    if (hrPeriod > 0xFFFF) hrPeriod = 0xFFFF;
-    if (hrPeriod < v4Params.minPeriodHr) hrPeriod = v4Params.minPeriodHr;
+    /* Cap at 30000 HR (~19 ms). HAL_ComTimer_ScheduleAbsolute uses an
+     * int16_t margin internally — anything > 32767 wraps negative and
+     * triggers the ASAP-fire path, which fires CCT3 immediately and
+     * (catastrophically) before this function sets phase = CL. With
+     * ALIGN→CL direct, the seed is INITIAL_STEP_PERIOD × 78.125
+     * = 62500 HR, which would always trip without this cap. 30000 HR
+     * is plenty for the first sector swing from align. */
+    if (hrPeriod > 30000UL) hrPeriod = 30000UL;
+    if (hrPeriod < escParams.minPeriodHr) hrPeriod = escParams.minPeriodHr;
 
     timerPeriod = (uint16_t)hrPeriod;
     integrator  = timerPeriod;
@@ -352,65 +264,41 @@ static void EnterCL(void)
     actualAmplitude = (uint16_t)((rampDuty * 32768UL) / LOOPTIME_TCY);
     targetAmplitude = actualAmplitude;
 
-    /* Configure CCP2 for current floating phase.
-     * Flush FIFOs and clear flags BEFORE enabling ISRs to prevent
-     * stale noise edges from setting v4_captureValid. */
-    const COMMUTATION_STEP_T *step = &commutationTable[position];
-    HAL_Capture_Configure(bemfRpPin[step->floatingPhase],
-                          step->zcPolarity > 0);
-    HAL_Capture_SetBlanking(timerPeriod);
-
-    /* Flush any accumulated edges before enabling capture ISRs */
-    while (CCP2STATbits.ICBNE) (void)CCP2BUF;
-    while (CCP5STATbits.ICBNE) (void)CCP5BUF;
-    _CCP2IF = 0;
-    _CCP5IF = 0;
-    v4_captureValid = false;
-
-    HAL_Capture_Start();
-    HAL_PTG_Start();       /* V5.0 — no-op unless FEATURE_V5_PTG_ZC=1 */
-
-    /* Seed lastCommHR for PI elapsed calculation */
+    /* Stage A: PTG is already running from the OL ramp. Just clear any
+     * stale capture flag from the final OL sector. lastCommHR is
+     * refreshed below so SCCP3's first compare-match lands a full
+     * timerPeriod from "now". */
+    captureValid = false;
     lastCommHR = HAL_ComTimer_ReadTimer();
 
-    /* Seed v4_blankingEndHR so the ADC ISR's blanking gate is sane
+    /* Seed blankingEndHR so the ADC ISR's blanking gate is sane
      * during the first CL sector — before Commutate has a chance to
      * write it.  Without this, a stale 0 from init lets every ADC
      * sample past the gate. */
     {
-        extern volatile uint16_t v4_blankingEndHR;
-        uint8_t  pct      = v4Params.blankingPct;
+        extern volatile uint16_t blankingEndHR;
+        uint8_t  pct      = escParams.blankingPct;
         uint16_t blankHR;
         if (pct == 0U || pct > 100U) {
             blankHR = timerPeriod >> 2;
         } else {
             blankHR = (uint16_t)(((uint32_t)timerPeriod * pct) / 100U);
         }
-        v4_blankingEndHR = (uint16_t)(lastCommHR + blankHR);
+        blankingEndHR = (uint16_t)(lastCommHR + blankHR);
     }
 
-#if FEATURE_V5_SCHEDULER
-    /* V5.3: seed scheduler state from ramp period. sched_Tsector is
-     * the per-physical-sector period (not 2× like V4's measured).
-     * First-capture flag tells CCP ISR to accept the first capture
-     * unconditionally and use the ramp-derived sched_Tsector for
-     * its initial schedule — avoids computing dt from stale seeds. */
-    sched_Tsector       = (uint16_t)hrPeriod;
-    sched_thisCaptureHR = 0;
-    sched_prevCaptureHR = 0;
-    sched_captureSource = 0;
-    sched_firstCapture  = true;
-    sched_diagRisingAcc    = 0;
-    sched_diagFallingAcc   = 0;
-    sched_diagImplausible  = 0;
-    sched_diagScheduleLate = 0;
-    sched_diagScheduleOk   = 0;
-#endif
+
+    /* Set phase BEFORE arming the schedule. ScheduleAbsolute's ASAP-
+     * fire path raises _CCT3IF=1 which preempts at IPL 6 immediately,
+     * and CCT3's ISR (Commutate) bails on `phase != SECTOR_PHASE_CL`.
+     * If we armed first and the schedule went ASAP-fast, Commutate
+     * would early-return AND the ISR's self-disable would leave the
+     * schedule dead. Setting phase first guarantees Commutate accepts
+     * the first fire, advances position, and re-arms SCCP3. */
+    phase = SECTOR_PHASE_CL;
 
     /* Schedule first CL commutation via one-shot SCCP3 */
     HAL_ComTimer_ScheduleAbsolute(lastCommHR + timerPeriod);
-
-    phase = V4_CLOSED_LOOP;
 
     /* Enable throttle after a short delay (handled in TimeTick) */
 }
@@ -422,15 +310,13 @@ static void EnterCL(void)
 void SectorPI_Init(void)
 {
     /* Load runtime tunables from compile-time defaults BEFORE the HAL
-     * inits run — HAL_Capture_SetBlanking and the PI loop both consume
-     * v4Params on first use. */
-    V4Params_InitDefaults();
+     * inits run — the PI loop consumes escParams on first use. */
+    Params_InitDefaults();
 
     HAL_ComTimer_Init();   /* SCCP3 one-shot + SCCP4 HR (proven V3 pattern) */
-    HAL_Capture_Init();
-    HAL_PTG_Init();        /* V5.0 — no-op unless FEATURE_V5_PTG_ZC=1 */
+    HAL_PTG_Init();
     running = false;
-    phase = V4_OFF;
+    phase = SECTOR_PHASE_OFF;
     statusEvents = 0;
     sectorCount = 0;
 }
@@ -456,11 +342,6 @@ void SectorPI_Start(uint16_t vbusRaw)
     speedCounter = 0;
     speedBase = 0;
     measuredSpeed = 0;
-    /* Reset SP state so a previous run's latched request doesn't
-     * carry over into the next start. */
-    v4_spRequest = false;
-    v4_spActive = false;
-    HAL_PWM_SetSPFlag(false);
 
     /* Reset capture-rate diagnostic counters (defined in garuda_service.c
      * for the ADC ISR side, sector_pi.c for the Commutate side). Lets us
@@ -468,33 +349,31 @@ void SectorPI_Start(uint16_t vbusRaw)
     diagCaptures = 0;
     diagPiRuns = 0;
     diagCommutateNoCapture = 0;
-    extern volatile uint32_t v4_adcBlankReject;
-    extern volatile uint32_t v4_adcStateMismatch;
-    extern volatile uint32_t v4_adcCaptureSet;
-    extern volatile uint32_t v4_adcSetRising;
-    extern volatile uint32_t v4_adcAlreadySet;
-    v4_adcBlankReject = 0;
-    v4_adcStateMismatch = 0;
-    v4_adcCaptureSet = 0;
-    v4_adcSetRising = 0;
-    v4_adcAlreadySet = 0;
-    extern volatile uint32_t v4_offMidCapture;
-    extern volatile uint32_t v4_offMidMismatch;
-    v4_offMidCapture = 0;
-    v4_offMidMismatch = 0;
-    extern volatile uint32_t v5_postZcRisingAcc;
-    extern volatile uint32_t v5_postZcRisingRej;
-    extern volatile uint32_t v5_postZcFallingAcc;
-    extern volatile uint32_t v5_postZcFallingRej;
-    v5_postZcRisingAcc  = 0;
-    v5_postZcRisingRej  = 0;
-    v5_postZcFallingAcc = 0;
-    v5_postZcFallingRej = 0;
-    /* V5.2: reset measurement tracker to unseeded. It seeds on first
-     * valid commutation interval in Commutate. Smoothed companion is
-     * seeded from the raw value in TimeTick. */
-    v5_tMeasHR       = 0;
-    v5_tMeasHRSmooth = 0;
+    extern volatile uint32_t adcBlankReject;
+    extern volatile uint32_t adcStateMismatch;
+    extern volatile uint32_t adcCaptureSet;
+    adcBlankReject = 0;
+    adcStateMismatch = 0;
+    adcCaptureSet = 0;
+    extern volatile uint32_t postZcRisingAcc;
+    extern volatile uint32_t postZcRisingRej;
+    extern volatile uint32_t postZcFallingAcc;
+    extern volatile uint32_t postZcFallingRej;
+    postZcRisingAcc  = 0;
+    postZcRisingRej  = 0;
+    postZcFallingAcc = 0;
+    postZcFallingRej = 0;
+    /* Reset measurement tracker to unseeded. Raw value seeds on the
+     * first valid commutation interval in Commutate; smoothed value
+     * seeds from raw in TimeTick. */
+    tMeasHR       = 0;
+    tMeasHRSmooth = 0;
+
+    /* Stage A: OL-ramp ZC observation counters. Reset on every motor
+     * start so the GUI sees fresh corridor stats per run. */
+    olCapInCorridor    = 0;
+    olCapOutOfCorridor = 0;
+    olLastElapsedHR    = 0;
 
     /* Start alignment — Timer1 ISR drives via SectorPI_OlTick() */
     alignCounter = ALIGN_TIME_COUNTS;
@@ -506,7 +385,7 @@ void SectorPI_Start(uint16_t vbusRaw)
     HAL_PWM_SetCommutationStep(0);
     HAL_PWM_SetDutyCycle(MIN_DUTY);
 
-    phase = V4_ALIGN;
+    phase = SECTOR_PHASE_ALIGN;
 }
 
 void SectorPI_Stop(void)
@@ -519,7 +398,7 @@ void SectorPI_OlTick(void)
 {
     if (!running) return;
 
-    if (phase == V4_ALIGN)
+    if (phase == SECTOR_PHASE_ALIGN)
     {
         if (alignCounter > 0)
         {
@@ -541,277 +420,132 @@ void SectorPI_OlTick(void)
         }
         else
         {
-            /* Alignment done → start OL ramp */
-            phase = V4_OL_RAMP;
-        }
-        return;
-    }
-
-    if (phase == V4_OL_RAMP)
-    {
-        if (rampCounter > 0)
-            rampCounter--;
-
-        if (rampCounter == 0)
-        {
-            /* Advance to next commutation step */
-            position++;
-            if (position > 5) position = 0;
-            HAL_PWM_SetCommutationStep(position);
-
-            /* Compute new step period (V3 acceleration formula) */
-            #define ERPM_CONST ((uint32_t)TIMER1_FREQ_HZ * 10UL)
-            uint32_t curPeriod = rampStepPeriod;
-            if (curPeriod == 0) curPeriod = INITIAL_STEP_PERIOD;
-            uint32_t curErpm = ERPM_CONST / curPeriod;
-            uint32_t deltaErpm = ((uint32_t)RAMP_ACCEL_ERPM_S * curPeriod)
-                                 / TIMER1_FREQ_HZ;
-            if (deltaErpm < 1) deltaErpm = 1;
-            uint32_t newErpm = curErpm + deltaErpm;
-            uint32_t newPeriod = ERPM_CONST / newErpm;
-            if (newPeriod < MIN_STEP_PERIOD)
-                newPeriod = MIN_STEP_PERIOD;
-            rampStepPeriod = (uint16_t)newPeriod;
-            rampCounter = rampStepPeriod;
-
-            /* Gradually increase duty toward RAMP_DUTY_CAP */
-            if (rampDuty < RAMP_DUTY_CAP)
+            /* Alignment done → start OL ramp.
+             *
+             * Stage A: bring up the BEMF capture pipeline NOW so we
+             * observe ZCs during open-loop. Previously this was
+             * deferred to EnterCL(), which meant we transitioned to
+             * PI control with zero evidence the rotor was locked to
+             * the forced commutation rate. With capture running in
+             * OL, the diag fields olCapInCorridor / olCapOutOfCorridor
+             * accumulate per-sector evidence that the rotor is in
+             * sync — Stage B will gate the OL→CL handoff on this. */
             {
-                rampDuty += (LOOPTIME_TCY / 200);
-                if (rampDuty > RAMP_DUTY_CAP)
-                    rampDuty = RAMP_DUTY_CAP;
+                extern volatile uint8_t floatingPhase;
+                extern volatile uint8_t ptgExpectedComp;
+                const COMMUTATION_STEP_T *step = &commutationTable[position];
+                captureValid = false;
+
+                /* Publish sector globals so PTG sees consistent state
+                 * from the first BEMF sample onward. */
+                uint8_t newFp       = step->floatingPhase;
+                uint8_t newExpected = (uint8_t)(position & 1u);
+                currentSector  = position;
+                floatingPhase  = newFp;
+                ptgExpectedComp = newExpected;
+                sectorSnap = (uint16_t)(position
+                                      | ((uint16_t)newFp       << 3)
+                                      | ((uint16_t)newExpected << 5));
+
+                HAL_PTG_Start();
+                lastCommHR = HAL_ComTimer_ReadTimer();
+                /* Seed blankingEndHR so the very first OL sector's
+                 * ProcessBemfSample blanking check uses a sensible
+                 * threshold instead of zero (boot) or stale CL data. */
+                {
+                    extern volatile uint16_t blankingEndHR;
+                    uint16_t T_ol_HR0 = (uint16_t)(((uint32_t)rampStepPeriod
+                                                   * 625UL) / 8UL);
+                    blankingEndHR = (uint16_t)(lastCommHR + (T_ol_HR0 >> 2));
+                }
             }
+            /* ALIGN → CL direct. Bump rampDuty to half the ramp-cap so
+             * EnterCL inherits a duty that produces torque for the first
+             * sector swing (alignment duty is ~2.5%, way too low to
+             * drive the rotor through cogging). EnterCL computes its
+             * seed timerPeriod from rampStepPeriod (still holds
+             * INITIAL_STEP_PERIOD here) → conservative ~40 ms first
+             * sector. The piEnabled gate holds the PI back through the
+             * rough first sectors. The legacy OL_RAMP path was removed —
+             * OL ZC observation showed captures land at essentially
+             * random positions through the ramp, so it didn't actually
+             * sync the rotor before CL handoff. */
+            rampDuty = RAMP_DUTY_CAP / 2u;
             HAL_PWM_SetDutyCycle(rampDuty);
-
-            /* Speed counting for telemetry */
-            speedCounter++;
-            sectorCount++;
+            EnterCL();
         }
-
-        /* Ramp complete → transition to closed-loop.
-         * FEATURE_DEBUG_OL_ONLY=1 skips the handoff: motor plateaus at
-         * MIN_STEP_PERIOD speed with rampDuty = RAMP_DUTY_CAP and stays
-         * in forced commutation forever. Use during bring-up to confirm
-         * the motor is physically rotating before chasing BEMF/CL bugs.
-         *
-         * Settle window: once rampStepPeriod reaches MIN_STEP_PERIOD,
-         * keep firing at that forced rate for OL_HANDOFF_SETTLE_TICKS so
-         * the rotor (which lags the commanded rate during the ramp) has
-         * time to physically reach the target speed. Entering CL before
-         * the rotor catches up leaves the PI seeded with a timerPeriod
-         * faster than the rotor — every Commutate fires before BEMF can
-         * cross neutral, the V5_POST_ZC_OWN edge gate never triggers,
-         * and stallCounter trips out in ~1s. Decremented in Timer1 (1
-         * tick per OlTick) only after the speed target is reached. */
-#if !FEATURE_DEBUG_OL_ONLY
-        if (rampStepPeriod <= MIN_STEP_PERIOD)
-        {
-            if (olHandoffCounter > 0u)
-            {
-                olHandoffCounter--;
-            }
-            else
-            {
-                EnterCL();
-            }
-        }
-#endif
         return;
     }
 
     /* CL phase: CCP ISRs handle FIFO drain continuously */
 }
 
-/* ── V5.3 scheduler: one Commutate per physical sector ──────────
- * Called from SCCP3 ISR dispatch when FEATURE_V5_SCHEDULER=1. This
- * Commutate only advances PWM state — the scheduling of the NEXT
- * Commutate happens in the CCP2/CCP5 ISR when a new ZC capture
- * arrives. If no capture arrives, we fall back to a timer-based
- * re-fire at (thisCommHR + sched_Tsector) so the motor doesn't
- * stall.
- *
- * Position advances 1 per call, so Commutate rate = 6 per elec rev
- * = physical sector rate. Software position tracks physical rotor.
- *
- * Gated entirely by FEATURE_V5_SCHEDULER so when off, this function
- * doesn't exist in the binary.
- *
- * Diagnostics: sched_diag* counters, plus for backwards compat with
- * existing telemetry we populate actualStepPeriodHR/timerPeriod/
- * v4_timerPeriod from sched_Tsector so eTP reads match reality. */
-#if FEATURE_V5_SCHEDULER
-
-#define V5_SCHED_FORWARD_MARGIN_HR  10u    /* min forward margin on schedule */
-#define V5_SCHED_BLANKING_MIN_HR    10u    /* min blanking after commutation */
-
-static void CommutateV5_3(void)
-{
-    /* 1. Disable CCP ISRs during reconfiguration. */
-    _CCP2IE = 0;
-    _CCP5IE = 0;
-
-    uint16_t thisCommHR = HAL_ComTimer_ReadTimer();
-
-    /* 2. Advance position 1:1 with physical rotor. */
-    position++;
-    if (position > 5) position = 0;
-    v4_sectorHits[position]++;
-    /* Pair v4_floatingPhase, v5_ptgExpectedComp with v4_currentSector —
-     * see legacy path's comment for the race this closes. */
-    const COMMUTATION_STEP_T *step = &commutationTable[position];
-    extern volatile uint8_t v4_floatingPhase;
-#if FEATURE_V5_PTG_ZC || FEATURE_V5_POST_ZC_ACCEPT
-    extern volatile uint8_t v5_ptgExpectedComp;
-#endif
-    {
-        uint8_t newFp       = step->floatingPhase;
-        uint8_t newExpected = (uint8_t)(position & 1u);
-        v4_currentSector  = position;
-        v4_floatingPhase  = newFp;
-#if FEATURE_V5_PTG_ZC || FEATURE_V5_POST_ZC_ACCEPT
-        v5_ptgExpectedComp = newExpected;
-#endif
-    }
-    HAL_PWM_SetCommutationStep(position);
-
-    /* 3. Configure CCP for NEW sector's floating phase and ZC polarity. */
-    HAL_Capture_Configure(bemfRpPin[step->floatingPhase],
-                          step->zcPolarity > 0);
-
-    /* 4. Flush FIFOs, clear flags, reset captureValid. */
-    while (CCP2STATbits.ICBNE) (void)CCP2BUF;
-    while (CCP5STATbits.ICBNE) (void)CCP5BUF;
-    _CCP2IF = 0;
-    _CCP5IF = 0;
-    v4_captureValid = false;
-
-    /* 5. Blanking: 25% of sector period (minimum safety floor). */
-    uint16_t blankHR = sched_Tsector >> 2;
-    if (blankHR < V5_SCHED_BLANKING_MIN_HR) blankHR = V5_SCHED_BLANKING_MIN_HR;
-    extern volatile uint16_t v4_blankingEndHR;
-    v4_blankingEndHR = (uint16_t)(thisCommHR + blankHR);
-
-    /* 6. (v5_ptgExpectedComp moved to step-2, atomic with v4_currentSector.
-     * PG1TRIGB switching still lives in PTG ISR — UPDREQ-from-Commutate
-     * approach failed in 2026-05-13.) */
-
-    /* 7. Fallback schedule: if no capture arrives, re-fire at
-     * thisCommHR + sched_Tsector so the motor keeps moving. The
-     * common case is CCP ISR re-schedules us at (capture + T/2 -
-     * advance) before this fires. */
-    HAL_ComTimer_ScheduleAbsolute((uint16_t)(thisCommHR + sched_Tsector));
-
-    /* 8. Re-enable CCP ISRs. */
-    _CCP2IE = 1;
-    _CCP5IE = 1;
-
-    /* 9. Expose to existing telemetry paths so eTP/eRpm read correct. */
-    actualStepPeriodHR = sched_Tsector;
-    timerPeriod        = sched_Tsector;
-    v4_timerPeriod     = sched_Tsector;
-    lastCommHR         = thisCommHR;
-
-    /* 10. Speed counting. */
-    speedCounter++;
-    sectorCount++;
-}
-#endif /* FEATURE_V5_SCHEDULER */
 
 /* ── Called from SCCP3 ISR (sector timer match) — CL only ───────── */
 void SectorPI_Commutate(void)
 {
-    if (phase != V4_CLOSED_LOOP) return;
+    if (phase != SECTOR_PHASE_CL) return;
 
-#if FEATURE_V5_SCHEDULER
-    CommutateV5_3();
-    return;
-#endif
-
-    /* V4 path below — unchanged when FEATURE_V5_SCHEDULER=0. */
-
-    /* 1. Disable CCP ISRs during critical section */
-    _CCP2IE = 0;
-    _CCP5IE = 0;
-
-    /* 2. Consume best corridor candidate from previous sector */
+    /* 1. Consume best corridor candidate from previous sector */
     uint16_t thisCommHR = HAL_ComTimer_ReadTimer();
     uint16_t prevCommHR = lastCommHR;
 
     /* 2.0 Close the cross-sector ADC race.  The ADC ISR (40 kHz, not
-     * disabled here) can fire between `v4_captureValid = false` below
+     * disabled here) can fire between `captureValid = false` below
      * and the new-sector blanking write further down.  With OLD
      * blankingEnd in the past, its `(now - blankingEnd) >= 0` gate
      * always passes → it captures the start of the new sector and
-     * the next Commutate sees a tiny capValue.  Symptom seen on prop
-     * startup with FEATURE_V5_POST_ZC_OWN=1: capVal cluster at <50 HR.
+     * the next Commutate sees a tiny capValue.
      *
      * Move the new blankingEnd into place *now*, before clearing
      * captureValid, so the gate rejects every ADC sample until real
      * blanking expires.  Width re-uses actualStepPeriodHR (sector
      * width is independent of position parity). */
     {
-        extern volatile uint16_t v4_blankingEndHR;
-        uint16_t guardSectorHR = (actualStepPeriodHR >= V4_MIN_PERIOD)
+        extern volatile uint16_t blankingEndHR;
+        uint16_t guardSectorHR = (actualStepPeriodHR >= MIN_PERIOD_HR)
                                  ? actualStepPeriodHR : timerPeriod;
-        uint8_t  guardPct      = v4Params.blankingPct;
+        uint8_t  guardPct      = escParams.blankingPct;
         uint16_t guardBlankHR;
         if (guardPct == 0U || guardPct > 100U) {
             guardBlankHR = guardSectorHR >> 2;
         } else {
             guardBlankHR = (uint16_t)(((uint32_t)guardSectorHR * guardPct) / 100U);
         }
-        v4_blankingEndHR = (uint16_t)(thisCommHR + guardBlankHR);
+        blankingEndHR = (uint16_t)(thisCommHR + guardBlankHR);
     }
     uint16_t measuredCommPeriod = (uint16_t)(thisCommHR - prevCommHR);
-    if (measuredCommPeriod >= V4_MIN_PERIOD)
+    if (measuredCommPeriod >= MIN_PERIOD_HR)
     {
         actualStepPeriodHR = measuredCommPeriod;
-#if FEATURE_V5_MEAS_PI
-        /* V5.2 tracker: halve measuredCommPeriod (raw reads 2× real sector
-         * period, root cause unresolved). Minimal single write — any
-         * additional ISR cycles destabilize the V4 Commutate timing. */
-        v5_tMeasHR = (uint16_t)(measuredCommPeriod >> 1);
-        if (v5_tMeasHR < V4_MIN_PERIOD) v5_tMeasHR = V4_MIN_PERIOD;
-#endif
-#if FEATURE_V5_MEAS_PI_OWN
-        /* V5.2 ownership: drive timerPeriod off the SMOOTHED tracker
-         * (v5_tMeasHRSmooth, filtered in TimeTick) — never the noisy
-         * raw v5_tMeasHR. One volatile read + 2 writes, no math, no
-         * branches beyond the SP gate. The reactive scheduler and
-         * fallback both read timerPeriod later in this ISR, so the
-         * overwrite steers commutation off measurement truth. The
-         * set-point PI block below still runs but its timerPeriod
-         * writes get overwritten by this one. Pre-seed guard: if the
-         * smoother hasn't seeded yet (early CL entry, first few
-         * Commutates), skip the overwrite so the ramp-seeded value
-         * from EnterCL stays intact. */
-        if (!v4_spActive && v5_tMeasHRSmooth >= V4_MIN_PERIOD) {
-            uint16_t t = v5_tMeasHRSmooth;
-            timerPeriod    = t;
-            integrator     = t;
-            v4_timerPeriod = t;
-        }
+#if FEATURE_MEAS_PI
+        /* Halve measuredCommPeriod — raw reads 2× the real sector
+         * period (root cause unresolved). Single write only: extra
+         * ISR cycles here destabilize Commutate timing. */
+        tMeasHR = (uint16_t)(measuredCommPeriod >> 1);
+        if (tMeasHR < MIN_PERIOD_HR) tMeasHR = MIN_PERIOD_HR;
 #endif
     }
     uint16_t capValue = CAP_SENTINEL;
 
-    /* Per-polarity PI-feed accounting (2026-05-14):
-     * position holds the JUST-CONSUMED sector index (incremented AFTER
-     * this block). Even positions = rising-BEMF sectors, odd = falling. */
+    /* Per-polarity PI-feed accounting. position holds the JUST-CONSUMED
+     * sector index (incremented after this block). Even = rising-BEMF,
+     * odd = falling. */
     bool sectorWasRising = ((position & 1u) == 0u);
 
-    if (v4_captureValid)
+    /* Plausibility filter — width against the actual measured rotor
+     * sector (truth), not the PI estimate. timerPeriod can settle ~2×
+     * T_rotor, which lets cross-sector captures pass and locks the
+     * system into an every-other-sector miss pattern. Fall back to
+     * timerPeriod only on the very first commutation when
+     * actualStepPeriodHR isn't initialized yet. */
+    uint16_t filterHR = (actualStepPeriodHR >= MIN_PERIOD_HR)
+                        ? actualStepPeriodHR : timerPeriod;
+    diagFilterHRLast = filterHR;
+
+    if (captureValid)
     {
-        uint16_t elapsed = (uint16_t)(v4_lastCaptureHR - prevCommHR);
-        /* Filter against the actual measured rotor sector, not the PI
-         * estimate. timerPeriod can settle ~2× T_rotor, which lets cross-
-         * sector captures pass and locks the system into an every-other-
-         * sector miss pattern. Use the truth: actualStepPeriodHR. Fall
-         * back to timerPeriod only on the very first commutation when
-         * actualStepPeriodHR isn't initialized yet. */
-        uint16_t filterHR = (actualStepPeriodHR >= V4_MIN_PERIOD)
-                            ? actualStepPeriodHR : timerPeriod;
-        diagFilterHRLast = filterHR;
+        uint16_t elapsed = (uint16_t)(lastCaptureHR_g - prevCommHR);
         if (elapsed < filterHR)
         {
             capValue = elapsed;
@@ -825,7 +559,7 @@ void SectorPI_Commutate(void)
             if (sectorWasRising) { diagPiMissRising++;  diagElapsedRejectRising  = elapsed; }
             else                 { diagPiMissFalling++; diagElapsedRejectFalling = elapsed; }
         }
-        v4_captureValid = false;
+        captureValid = false;
     }
     else
     {
@@ -833,83 +567,31 @@ void SectorPI_Commutate(void)
         if (sectorWasRising) diagPiMissRising++;
         else                 diagPiMissFalling++;
     }
-    /* Re-arm the V5_POST_ZC_OWN edge-detection gate. The ADC ISR can
-     * only accept on a pre→post transition; this clears the per-sector
-     * "pre seen" latch so the new sector starts ungated. */
-    {
-        extern volatile uint8_t v5_sawPreZc;
-        v5_sawPreZc = 0u;
-    }
     lastCommHR = thisCommHR;
-
-    /* 2.5. SP mode transition — applied at sector boundary so the
-     * previous sector's ZC (consumed above) isn't dropped by a
-     * mid-sector MPER swap. ZC source switches between ADC midpoint
-     * (normal) and CCP hardware capture (SP) via v4_spActive. */
-    if (v4_spActive != v4_spRequest)
-    {
-        while (CCP2STATbits.ICBNE) (void)CCP2BUF;
-        while (CCP5STATbits.ICBNE) (void)CCP5BUF;
-        _CCP2IF = 0;
-        _CCP5IF = 0;
-        /* v4_captureValid already cleared above after consumption */
-
-        if (v4_spRequest)
-        {
-            MPER = 0xFFFFU;
-        }
-        else
-        {
-            MPER = LOOPTIME_TCY;
-            PG1TRIGA = 0x00000000UL;    /* CAHALF=0, TRIGA=0 — period boundary = MID-OFF (CK-equivalent) */
-            g_pwmPer = LOOPTIME_TCY;
-        }
-        PG1STATbits.UPDREQ = 1;
-        PG2STATbits.UPDREQ = 1;
-        PG3STATbits.UPDREQ = 1;
-        v4_spActive = v4_spRequest;
-        HAL_PWM_SetSPFlag(v4_spActive);
-    }
 
     /* 3. Advance to next commutation step.
      *
-     * THE PAIRING INVARIANT: the three per-sector globals
-     *   v4_currentSector  — software sector index 0..5
-     *   v4_floatingPhase  — which BEMF GPIO PTG should read (0=A 1=B 2=C)
-     *   v5_ptgExpectedComp — post-ZC comp state (0=rising, 1=falling sector)
-     * MUST be written back-to-back, in this same block. Reason:
+     * INVARIANT: the three per-sector globals
+     *   currentSector  — software sector index 0..5
+     *   floatingPhase  — which BEMF GPIO PTG should read (0=A 1=B 2=C)
+     *   ptgExpectedComp   — post-ZC comp state (0=rising, 1=falling)
+     * MUST be written back-to-back inside this block.
      *
-     * Commutate runs at IPL 6, PTG runs at IPL 5. PTG cannot preempt
-     * Commutate. BUT — Commutate can preempt PTG mid-flight. The PTG
-     * ISR reads these globals across several statements (probe → tally
-     * → deglitch → comp classification). If Commutate's writes were
-     * spread across many statements (as they were before 2026-05-15),
-     * PTG could see a mid-update snapshot:
+     * Commutate runs at IPL 6, PTG at IPL 5 — PTG cannot preempt
+     * Commutate, but Commutate can preempt PTG mid-flight. PTG reads
+     * these globals across several statements. If Commutate's writes
+     * were spread out, PTG could see a partial update (e.g. old sector
+     * index, new expected-comp) and misbin the sample.
      *
-     *      PTG reads v4_currentSector (= old sector, e.g. 1=falling)
-     *      Commutate preempts and updates all three globals to N=2 (rising)
-     *      PTG resumes, reads v5_ptgExpectedComp (= NEW sector's parity, 0=rising)
-     *      → tally bins this sample as "sector 1 falling, expected rising"
-     *        which is incoherent
-     *
-     * Before this fix, the three writes lived ~60-100 lines apart.
-     * Bench observation: fpStale = 7%, and cR (rising-sector captures)
-     * stayed at 0 forever because stale v5_ptgExpectedComp from the
-     * previous (falling) sector misbinned rising captures as falling.
-     *
-     * After this fix: fpStale = ~4% (residual probe-side race that
-     * doesn't affect the deglitch later in the PTG ISR), and cR climbs
-     * during the first few CL frames before 2T:ε pacing locks in.
-     *
-     * If you add a new per-sector global that BOTH Commutate writes
-     * AND PTG reads, write it inside this same block. */
+     * If you add a new per-sector global written by Commutate and read
+     * by PTG, write it inside this same block. */
     position++;
     if (position > 5) position = 0;
-    v4_sectorHits[position]++;
+    sectorHits[position]++;
     {
-        extern volatile uint8_t v4_floatingPhase;
-#if FEATURE_V5_PTG_ZC || FEATURE_V5_POST_ZC_ACCEPT
-        extern volatile uint8_t v5_ptgExpectedComp;
+        extern volatile uint8_t floatingPhase;
+#if FEATURE_POST_ZC_ACCEPT
+        extern volatile uint8_t ptgExpectedComp;
 #endif
         /* Compute new values BEFORE writing any volatile global.
          * If PTG preempts mid-compute we don't care — none of the
@@ -917,36 +599,27 @@ void SectorPI_Commutate(void)
          * sector consistently. */
         uint8_t newFp       = commutationTable[position].floatingPhase;
         uint8_t newExpected = (uint8_t)(position & 1u);
-        /* Now publish all three. Compiler may reorder these three
-         * stores relative to each other (they're independent), which
-         * is fine — the only guarantee we need is that no other
-         * code runs in between, and that's guaranteed by being in
-         * the same ISR with PTG at lower priority. */
-        v4_currentSector  = position;
-        v4_floatingPhase  = newFp;
-#if FEATURE_V5_PTG_ZC || FEATURE_V5_POST_ZC_ACCEPT
-        v5_ptgExpectedComp = newExpected;
+        uint16_t newSnap    = (uint16_t)(position
+                                       | ((uint16_t)newFp       << 3)
+                                       | ((uint16_t)newExpected << 5));
+        /* Publish all four. The single 16-bit sectorSnap write is the
+         * atomic one PTG actually reads. The three byte-wide globals
+         * are retained for callers that legitimately need just one
+         * (e.g. ReadBEMFComp's static-inline switch). */
+        currentSector  = position;
+        floatingPhase  = newFp;
+#if FEATURE_POST_ZC_ACCEPT
+        ptgExpectedComp = newExpected;
 #endif
+        sectorSnap     = newSnap;
     }
     HAL_PWM_SetCommutationStep(position);
 
-    /* 4. Configure CCP for new phase, flush FIFOs */
+    /* 4. Set blanking + expected ZC for CCP ISR.
+     * floatingPhase is written atomically in step-3 above. */
     {
-        const COMMUTATION_STEP_T *step = &commutationTable[position];
-        HAL_Capture_Configure(bemfRpPin[step->floatingPhase],
-                              step->zcPolarity > 0);
-        while (CCP2STATbits.ICBNE) (void)CCP2BUF;
-        while (CCP5STATbits.ICBNE) (void)CCP5BUF;
-        _CCP2IF = 0;
-        _CCP5IF = 0;
-    }
-
-    /* 5. Set blanking + floating phase + expected ZC for CCP ISR.
-     * v4_floatingPhase moved to step-3 (2026-05-15b) so it's no longer
-     * declared here. */
-    {
-        extern volatile uint16_t v4_blankingEndHR;
-        extern volatile uint16_t v4_expectedZcHR;
+        extern volatile uint16_t blankingEndHR;
+        extern volatile uint16_t expectedZcHR;
 
         /* Blanking: 25% of measured rotor sector. Always use
          * actualStepPeriodHR (truth) instead of timerPeriod (PI estimate
@@ -954,27 +627,18 @@ void SectorPI_Commutate(void)
          * Fall back to timerPeriod only on first commutation before
          * actualStepPeriodHR is initialized.
          * In SP mode, extend past pulse turn-off + 10µs settle. */
-        uint16_t sectorHR = (actualStepPeriodHR >= V4_MIN_PERIOD)
+        uint16_t sectorHR = (actualStepPeriodHR >= MIN_PERIOD_HR)
                             ? actualStepPeriodHR : timerPeriod;
-        /* Runtime blanking (V4 Commutate ISR) — was hardcoded `>> 2`
-         * (25%), ignoring v4Params.blankingPct.  Wired up 2026-04-28
-         * so SET_PARAM 0xF3 actually takes effect.  Fallback to 25%
-         * if pct is zero or out of range. */
-        uint8_t  blankPct = v4Params.blankingPct;
+        /* Runtime blanking — read escParams.blankingPct (GUI-tunable
+         * via SET_PARAM 0xF3). Fallback to 25% if pct is invalid. */
+        uint8_t  blankPct = escParams.blankingPct;
         uint16_t blankHR;
         if (blankPct == 0U || blankPct > 100U) {
             blankHR = sectorHR >> 2;   /* safe fallback */
         } else {
             blankHR = (uint16_t)(((uint32_t)sectorHR * blankPct) / 100U);
         }
-        if (v4_spActive)
-        {
-            uint16_t dutyHR = (uint16_t)(((uint32_t)actualAmplitude
-                                          * sectorHR) >> 15);
-            uint16_t spBlankHR = dutyHR + 16U;   /* +10.2µs settle */
-            if (spBlankHR > blankHR) blankHR = spBlankHR;
-        }
-        v4_blankingEndHR = (uint16_t)(thisCommHR + blankHR);
+        blankingEndHR = (uint16_t)(thisCommHR + blankHR);
 
         /* Expected ZC = prev_comm + T/2 + advance (physical ZC position).
          * Matches the reactive scheduler: targetHR = ZC + (T/2 - advance),
@@ -983,31 +647,9 @@ void SectorPI_Commutate(void)
         uint16_t halfHR_exp = sectorHR >> 1;
         uint16_t tal_exp    = (sectorHR < 260) ? 3U : 2U;
         uint16_t advHR_exp  = (uint16_t)((sectorHR >> 3) * tal_exp);
-        v4_expectedZcHR = (uint16_t)(thisCommHR + halfHR_exp + advHR_exp);
+        expectedZcHR = (uint16_t)(thisCommHR + halfHR_exp + advHR_exp);
 
-        /* v4_floatingPhase is now written at step-3 (atomic with
-         * v4_currentSector) — see comment there. The redundant write
-         * that used to live here was deleted 2026-05-15b along with
-         * the local `step` pointer that only fed it. */
-
-        /* v5_ptgExpectedComp is now written at step-3 (atomic with
-         * v4_currentSector and v4_floatingPhase) — see comment there.
-         * The redundant write that used to live here was deleted on
-         * 2026-05-15c after fpStale = 4 % + cR = 0 showed the late
-         * write was miscategorising rising captures as falling. */
-        /* HAL_PTG_SetDelay call intentionally removed for this test. */
     }
-
-    /* 6. Re-enable CCP ISRs (always).
-     *
-     * Phase C attempt (2026-04-21) gated this on v4_spActive —
-     * tripped at ~100k eRPM even with Phase A inline drain in place.
-     * The CCP ISR preemption (pri 4 preempts ADC ISR pri 3, fires
-     * on every edge, not batched to PWM center) is load-bearing in
-     * a way inline drain can't replicate. Reverted; CCP ISRs stay
-     * always-on. */
-    _CCP2IE = 1;
-    _CCP5IE = 1;
 
     /* Track good-capture streak for diagnostics, and consecutive-miss
      * streak for block-commutation exit (V4 captures only rising-edge
@@ -1034,52 +676,64 @@ void SectorPI_Commutate(void)
     {
         diagPiRuns++;
 
-        /* AVR-style set-point PI synchronizer (matches motor.c:441-450).
-         *   setValue = (advance + 30°) × T / 60° + RC_DELAY  (expected ZC pos)
-         *   delta    = capValue - setValue                   (signed phase error)
-         *   integrator += delta >> Ki_SHIFT                  (Ki = 1/16)
-         *   timerPeriod = integrator + (delta >> Kp_SHIFT)   (Kp = 1/4)
+        /* Stage C: piEnabled gate. While the gate is closed (early CL
+         * after ALIGN→CL-direct startup), the PI math is skipped
+         * entirely — timerPeriod stays at the conservative seed value
+         * and the reactive scheduler below self-paces commutations off
+         * each capture's timestamp. The rotor accelerates naturally
+         * without the PI trying to track an unstable signal.
          *
-         * Replaces the IIR ratio formula `timerPeriod = (3*old + 1.5*cap)/4`
-         * which had a stable 3-cycle limit attractor instead of a single
-         * fixed-point equilibrium (CSV evidence: timerPeriod cycled
-         * 224→270→253 indefinitely at 120k eRPM). Set-point PI converges
-         * to a single value, removing the limit-cycle jitter that was
-         * destabilizing high-speed operation.
-         *
-         * SP gate kept: SP mode freezes timerPeriod since CCP captures
-         * have different timing semantics than midpoint-ADC. */
-        if (!v4_spActive)
+         * Lock trigger: corridorGoodStreak (≥ CORRIDOR_GOOD_THRESHOLD
+         * consecutive plausibility-passing captures) means the rotor
+         * has been producing usable BEMF for long enough to seed the
+         * PI from measurement. Tp is set so setValue matches the
+         * latest capValue (inverse of setValue = ((advFp8·Tp) >> 8) +
+         * RC_DELAY → Tp = ((capValue - RC_DELAY) << 8) / advFp8). The
+         * floor mechanism that previously gated on commandEnabled is
+         * gone — piEnabled subsumes it. */
+        if (!piEnabled)
         {
-            /* Snapshot runtime params once per cycle. They're written by
-             * the GSP set-param path on a low-priority code path; reading
-             * to locals here keeps the ISR consistent within a cycle even
-             * if the GUI changes a value mid-update. */
-            uint16_t advFp8     = v4Derived.advancePlus30Fp8;
-            uint8_t  kpShift    = v4Params.piKpShift;
-            uint8_t  kiShift    = v4Params.piKiShift;
-            uint16_t minPeriod  = v4Params.minPeriodHr;
+            if (corridorGoodStreak >= CORRIDOR_GOOD_THRESHOLD) {
+                uint16_t advFp8    = escDerived.advancePlus30Fp8;
+                uint16_t minPeriod = escParams.minPeriodHr;
+                uint32_t adj = (capValue > RC_DELAY_HR)
+                               ? (uint32_t)(capValue - RC_DELAY_HR) : 0u;
+                uint32_t newTp = (advFp8 > 0u) ? ((adj << 8) / advFp8)
+                                               : (uint32_t)timerPeriod;
+                if (newTp < minPeriod) newTp = minPeriod;
+                if (newTp > 0xFFFFu)   newTp = 0xFFFFu;
+                timerPeriod   = (uint16_t)newTp;
+                integrator    = timerPeriod;
+                timerPeriod_g = timerPeriod;
+                piEnabled = true;
+            }
+            /* Gate still closed — Tp stays at seed; PI math skipped.
+             * The reactive scheduler below uses lastCaptureHR_g to time
+             * the next commutation, so the rotor's BEMF drives pacing
+             * even while the PI is dormant. */
+        }
+        else
+        {
+            /* AVR-style set-point PI synchronizer (matches motor.c:441-450).
+             *   setValue = (advance + 30°) × T / 60° + RC_DELAY  (expected ZC pos)
+             *   delta    = capValue - setValue                   (signed phase error)
+             *   integrator += delta >> Ki_SHIFT                  (Ki = 1/16)
+             *   timerPeriod = integrator + (delta >> Kp_SHIFT)   (Kp = 1/4) */
+            uint16_t advFp8     = escDerived.advancePlus30Fp8;
+            uint8_t  kpShift    = escParams.piKpShift;
+            uint8_t  kiShift    = escParams.piKiShift;
+            uint16_t minPeriod  = escParams.minPeriodHr;
 
             uint16_t setValue = (uint16_t)(((uint32_t)advFp8 * timerPeriod) >> 8)
-                                + V4_RC_DELAY_HR;
+                                + RC_DELAY_HR;
             int32_t delta = (int32_t)capValue - (int32_t)setValue;
 
-            /* Per-capture delta clamp — bounds each PI correction to
-             * ±25% of current timerPeriod. Prevents runaway from any
-             * single noisy capture (observed under prop load: first
-             * post-handoff captures arrive at unpredictable timestamps,
-             * unclamped PI shortened timerPeriod aggressively → phantom
-             * 700k+ eRPM → SP trip). Normal-operation deltas are <5%
-             * of timerPeriod, so this clamp is invisible during steady
-             * state. Each capture can still nudge the PI; it just can't
-             * cliff-edge a single bad sample. */
+            /* Per-capture delta clamp at ±25% of timerPeriod prevents
+             * runaway from a single noisy capture. */
             int32_t deltaCap = (int32_t)timerPeriod >> 2;
             if (delta >  deltaCap) delta =  deltaCap;
             if (delta < -deltaCap) delta = -deltaCap;
 
-            /* Diagnostic snapshot — first PI_LOG_ENTRIES PI runs after CL.
-             * timerPeriod is the value PI is operating ON (pre-update).
-             * delta is post-clamp (what PI actually applies). */
             if (piLogCount < PI_LOG_ENTRIES) {
                 uint8_t i = piLogCount;
                 piLog[i].timerPeriod  = timerPeriod;
@@ -1089,64 +743,37 @@ void SectorPI_Commutate(void)
                 piLogCount = (uint8_t)(i + 1U);
             }
 
-            /* Seed floor during CL_SETTLE only — gives the PI 500ms to
-             * stabilize at handoff speed before letting it shrink Tp
-             * freely. Without this, PI can shrink Tp to minPeriod (=10)
-             * within the first few captures at CL entry, blowing
-             * stallCounter past 200 in a single tick (observed
-             * 2026-05-12). After cE=1, floor lifts and PI tracks
-             * natural rotor speed — that path validated motor reaching
-             * 200k+ eRPM in same trace. */
             int32_t newInt = (int32_t)integrator + (delta >> kiShift);
             if (newInt < minPeriod) newInt = minPeriod;
-            if (!commandEnabled && newInt < (int32_t)seedIntegrator)
-                newInt = (int32_t)seedIntegrator;
-            if (newInt > 0xFFFF) newInt = 0xFFFF;
+            if (newInt > 0xFFFF)    newInt = 0xFFFF;
             integrator = (uint16_t)newInt;
 
             int32_t newPer = (int32_t)integrator + (delta >> kpShift);
             if (newPer < minPeriod) newPer = minPeriod;
-            if (!commandEnabled && newPer < (int32_t)seedIntegrator)
-                newPer = (int32_t)seedIntegrator;
-            if (newPer > 0xFFFF) newPer = 0xFFFF;
+            if (newPer > 0xFFFF)    newPer = 0xFFFF;
             timerPeriod = (uint16_t)newPer;
-            v4_timerPeriod = timerPeriod;  /* expose for CCP ISR */
+            timerPeriod_g = timerPeriod;
         }
 
         /* Reactive target: ZC timestamp + delay-to-next-commutation.
+         * PI's setValue stays at fixed advance (its own model);
+         * scheduler uses speed-adaptive TAL ramp below.
          *
-         * Speed-adaptive advance (proven 196k baseline):
-         *   schedPeriod >= 260 HR (≤60k eRPM): TAL=2 → 15° advance
-         *   schedPeriod <  260 HR (>60k eRPM): TAL=3 → 22.5° advance
-         *
-         * The 2026-04-28 unification (using v4Derived.advancePlus30Fp8
-         * for both PI and scheduler) removed this ramp and motor walled
-         * at 130k.  Restored: PI's setValue stays at fixed 15° (its own
-         * model); scheduler keeps speed-adaptive ramp. */
-        uint16_t schedPeriod = v4_spActive ? actualStepPeriodHR : timerPeriod;
+         * Unifying PI and scheduler advance (using advancePlus30Fp8
+         * for both) walls the motor at 130k. Predicted scheduling
+         * anchored to thisCommHR with >30° advance regresses peak
+         * because timerPeriod saturates at minPeriodHr. Keep separate. */
+        uint16_t schedPeriod = timerPeriod;
         uint16_t halfHR = schedPeriod >> 1;
-        /* Speed-adaptive TAL ramp:
-         *   schedPeriod >= 260 HR (≤60k eRPM):  TAL=2 → 15°
-         *   130-260   (60-120k eRPM):           TAL=3 → 22.5°
-         *   schedPeriod < 130 HR (>120k eRPM):  TAL=4 → 30°
-         * 4th band added 2026-04-28 to push past 178k wall.
-         *
-         * Predicted-scheduling experiment 2026-04-28: tried thisCommHR-
-         * anchored target above 175k for >30° advance. Regressed peak
-         * 195k→178k because timerPeriod saturates at minPeriodHr giving
-         * a bad period estimate. Reverted; current TAL=4 floor at 195k
-         * may be a real BEMF/timing limit, not a scheduler one. */
-        /* TAL band 2026-05-13: added 5th band (TAL=5 = 37.5°) at <100 HR
-         * (>156k eRPM). AK rising-only feeds PI at half-rate, so extra
-         * advance at top end compensates for PI lag. */
-        uint16_t tal;
-        if      (schedPeriod >= 260U) tal = 2U;     /* ≤60k:    15° */
-        else if (schedPeriod >= 130U) tal = 3U;     /* 60-120k: 22.5° */
-        else if (schedPeriod >= 100U) tal = 4U;     /* 120-156k:30° */
-        else                          tal = 5U;     /* >156k:   37.5° */
+        /* CK reference (sector_pi.c:610): 2 levels, cap at 22.5°.
+         * The aggressive 4-level table (cap 37.5°) was an experiment to
+         * push the 60 kHz peak past 225k. At 40 kHz the larger advance
+         * exits the PHASE_ADVANCE_DEG window — bench showed regression
+         * when 12.5°→16.5° was tried. Match CK's proven cadence. */
+        uint16_t tal = (schedPeriod < 260U) ? 3U : 2U;   /* 22.5° / 15° */
         uint16_t advHR  = (uint16_t)((schedPeriod >> 3) * tal);
         uint16_t delayHR = (halfHR > advHR) ? (uint16_t)(halfHR - advHR) : 2U;
-        uint16_t targetHR = (uint16_t)(v4_lastCaptureHR + delayHR);
+        uint16_t targetHR = (uint16_t)(lastCaptureHR_g + delayHR);
 
         diagDelta = (int16_t)(targetHR - thisCommHR);  /* margin */
         HAL_ComTimer_ScheduleAbsolute(targetHR);
@@ -1157,28 +784,26 @@ void SectorPI_Commutate(void)
          * period in SP. `timerPeriod` is a detector model in normal mode
          * and can be ~2x actual sector near 70k, which immediately
          * desyncs SP if used as the fallback period. */
-        uint16_t schedPeriod = v4_spActive ? actualStepPeriodHR : timerPeriod;
+        uint16_t schedPeriod = timerPeriod;
         diagDelta = 0;
         HAL_ComTimer_ScheduleAbsolute(thisCommHR + schedPeriod);
     }
 
     /* 7. Stall detection.
-     * Weighted decrement (-2 on capture, +1 on miss) tolerates a ~33%
-     * capture-rate floor versus 50% for the original ±1 scheme. AK on
-     * the legacy V4 PRE-ZC path with piFeedPolarity=1 sees rising
-     * sectors only — every falling sector returns CAP_SENTINEL by
-     * design, so the per-commutation capture rate caps at 50% even
-     * with 100% rising hit rate. Weighted scheme keeps stall counter
-     * balanced at this structural rate. */
+     * Weighted decrement (-2 on capture, +1 on miss) tolerates a low
+     * capture-rate floor — the BEMF sampler is polarity-asymmetric on
+     * this hardware (rising-sector samples land POST-ZC), so per-
+     * commutation capture rate sits around 50% even when the loop is
+     * healthy. Weighting keeps the counter balanced at that rate. */
     if (commandEnabled)
     {
         if (capValue == CAP_SENTINEL)
         {
             stallCounter++;
-            if (stallCounter > V4_STALL_THRESHOLD)
+            if (stallCounter > STALL_THRESHOLD)
             {
                 ShutOff();
-                statusEvents |= V4_EVENT_STALL;
+                statusEvents |= EVENT_STALL;
             }
         }
         else
@@ -1198,18 +823,8 @@ void SectorPI_Commutate(void)
      * SP sector. Otherwise the newly active phase can wait for the long
      * master frame before producing torque. */
     uint16_t per = LOOPTIME_TCY;
-    if (v4_spActive)
-    {
-        uint32_t spPer = (uint32_t)actualStepPeriodHR << 7;
-        if (spPer > 0xFFFFU) spPer = 0xFFFFU;
-        per = (uint16_t)spPer;
-    }
     g_pwmPer = per;
     HAL_PWM_SetDutyCyclePeriod((uint32_t)FixpMulU16(actualAmplitude, per), per);
-    if (v4_spActive)
-    {
-        PG1STATbits.TRSET = 1;
-    }
 
     /* 7. Speed counting */
     speedCounter++;
@@ -1224,36 +839,44 @@ void SectorPI_TimeTick(void)
 {
     if (!running) return;
 
-    /* CL settle: hold ramp duty for 2s after CL entry before
-     * allowing pot to take over. Lets PI stabilize. */
-    if (phase == V4_CLOSED_LOOP && !commandEnabled)
+    /* CL settle: hold ramp duty for 500 ms after CL entry before
+     * allowing pot to take over. At the timeout, if piEnabled hasn't
+     * already locked from corridorGoodStreak, force it now so the
+     * motor isn't stuck in gated-PI hang state. The PI inherits
+     * whatever timerPeriod the seed/scheduler converged to and starts
+     * tracking from there. */
+    if (phase == SECTOR_PHASE_CL && !commandEnabled)
     {
         if (clSettleCounter < CL_SETTLE_MS)
             clSettleCounter++;
         else
+        {
             commandEnabled = true;
+            if (!piEnabled) {
+                integrator = timerPeriod;
+                piEnabled  = true;
+            }
+        }
     }
 
-#if FEATURE_V5_MEAS_PI
-    /* V5.2: spike-filter + EMA over v5_tMeasHR at 1 kHz. The Commutate
-     * ISR writes raw halved period (noisy, occasional near-zero samples
-     * from back-to-back fires). Filtering here keeps the hot path
-     * minimal — TimeTick has microseconds of slack.
-     * Reject any sample less than half the current smoother (the
-     * back-to-back spike signature), and EMA-smooth the rest with
-     * α=1/4 (V5_MEAS_PI_ALPHA_SHIFT). MEAS_PI_OWN reads v5_tMeasHRSmooth. */
+#if FEATURE_MEAS_PI
+    /* Spike-filter + EMA over tMeasHR at 1 kHz. Commutate writes raw
+     * halved period (noisy, occasional near-zero samples from back-to-
+     * back fires); filtering here keeps the hot path minimal. Reject
+     * samples below half the current smoother (back-to-back spike
+     * signature), EMA-smooth the rest with α=1/4. */
     {
-        uint16_t sample = v5_tMeasHR;
-        if (sample >= V4_MIN_PERIOD) {
-            if (v5_tMeasHRSmooth < V4_MIN_PERIOD) {
-                v5_tMeasHRSmooth = sample;           /* seed */
-            } else if (sample >= (v5_tMeasHRSmooth >> 1)) {
-                int32_t err = (int32_t)sample - (int32_t)v5_tMeasHRSmooth;
-                int32_t nt  = (int32_t)v5_tMeasHRSmooth
-                              + (err >> V5_MEAS_PI_ALPHA_SHIFT);
-                if (nt < V4_MIN_PERIOD) nt = V4_MIN_PERIOD;
+        uint16_t sample = tMeasHR;
+        if (sample >= MIN_PERIOD_HR) {
+            if (tMeasHRSmooth < MIN_PERIOD_HR) {
+                tMeasHRSmooth = sample;           /* seed */
+            } else if (sample >= (tMeasHRSmooth >> 1)) {
+                int32_t err = (int32_t)sample - (int32_t)tMeasHRSmooth;
+                int32_t nt  = (int32_t)tMeasHRSmooth
+                              + (err >> MEAS_PI_ALPHA_SHIFT);
+                if (nt < MIN_PERIOD_HR) nt = MIN_PERIOD_HR;
                 if (nt > 0xFFFF)        nt = 0xFFFF;
-                v5_tMeasHRSmooth = (uint16_t)nt;
+                tMeasHRSmooth = (uint16_t)nt;
             }
             /* else: spike below half of smoother — drop sample */
         }
@@ -1268,19 +891,7 @@ void SectorPI_TimeTick(void)
         speedCounter = 0;
         speedBase = 0;
 
-        /* SP mode request — hysteresis based on measured eRPM.
-         * Actual transition (MPER write, capture flush) happens in
-         * Commutate ISR at a sector boundary, so the transition sector
-         * consumes its ZC before the ZC source changes. */
         uint32_t erpm = (uint32_t)measuredSpeed * 500UL;
-        if (!v4_spRequest && erpm >= SP_ENTER_ERPM)
-        {
-            v4_spRequest = true;
-        }
-        else if (v4_spRequest && erpm <= SP_EXIT_ERPM)
-        {
-            v4_spRequest = false;
-        }
 
         /* Block-commutation auto-engagement (Option A: duty saturation).
          * At ≥95% Q15 the PWM is already clipping near the period cap,
@@ -1288,14 +899,14 @@ void SectorPI_TimeTick(void)
          * active phase H gate solid-ON for the whole sector — no PWM
          * chopping. Equivalent to infinite switching frequency.
          *
-         * V4 captures rising-edge sectors only — falling sectors return
+         * We capture rising-edge sectors only — falling sectors return
          * CAP_SENTINEL by design — so corridorGoodStreak alternates near
          * 1 even at perfect lock. The first version gated entry on
          * `goodStreak > 50`, which was unreachable. Replaced with a
          * "stable at speed" gauge (10 speed-windows × 20 ms = 200 ms
          * above 150k) for entry, and the inverse `corridorMissStreak`
          * (consecutive sentinels) for the exit lock-loss check. */
-        if (erpm >= V4_BLOCK_ENTER_ERPM)
+        if (erpm >= BLOCK_ENTER_ERPM)
         {
             if (blockCommStableTicks < 0xFFFFu) blockCommStableTicks++;
         }
@@ -1309,7 +920,7 @@ void SectorPI_TimeTick(void)
         if (g_blockCommActive)
         {
             if (actualAmplitude < 29490U                 /* < 90% Q15 */
-                || erpm < V4_BLOCK_EXIT_ERPM
+                || erpm < BLOCK_EXIT_ERPM
                 || corridorMissStreak > 5U)
             {
                 g_blockCommActive = false;
@@ -1318,11 +929,10 @@ void SectorPI_TimeTick(void)
         }
         else
         {
-            if (actualAmplitude >= 31130U                /* ≥ 95% Q15 */
-                && erpm >= V4_BLOCK_ENTER_ERPM
+            if (actualAmplitude >= 30180U                /* ≥ 92% Q15 — entry */
+                && erpm >= BLOCK_ENTER_ERPM
                 && blockCommStableTicks >= 10U           /* ≥ 200 ms above enter eRPM */
                 && commandEnabled
-                && !v4_spActive
                 && blockExitCooldown == 0U)
             {
                 g_blockCommActive = true;
@@ -1350,23 +960,22 @@ void SectorPI_TimeTick(void)
     }
 }
 
-#ifdef V4_MIN_AMPLITUDE_PROFILE
-#define V4_MIN_AMPLITUDE  V4_MIN_AMPLITUDE_PROFILE   /* per-profile override (e.g. HiZ1460) */
+#ifdef MIN_AMPLITUDE_PROFILE
+#define MIN_AMPLITUDE  MIN_AMPLITUDE_PROFILE   /* per-profile override (e.g. HiZ1460) */
 #else
-#define V4_MIN_AMPLITUDE  5000U  /* ~15.3% duty — bumped from 4000 (12.2%) on
-                                  * 2026-04-29 because at 60 kHz the per-cycle
-                                  * switching overhead eats more of the shorter
-                                  * 16.7µs cycle, so 12.2% Q15 only delivers
-                                  * ~10% effective. Empirical desync threshold
-                                  * was ~12% commanded; 15.3% gives margin. */
+#define MIN_AMPLITUDE  5000U  /* ~15.3% Q15. At 60 kHz the per-cycle
+                                  * switching overhead eats more of the
+                                  * 16.7µs cycle, so 12.2% Q15 only
+                                  * delivers ~10% effective duty — below
+                                  * the desync threshold. */
 #endif
 
 void SectorPI_CommandSet(uint16_t amplitude)
 {
     if (commandEnabled)
     {
-        if (amplitude < V4_MIN_AMPLITUDE)
-            amplitude = V4_MIN_AMPLITUDE;
+        if (amplitude < MIN_AMPLITUDE)
+            amplitude = MIN_AMPLITUDE;
         targetAmplitude = amplitude;
     }
 }
@@ -1406,11 +1015,11 @@ void SectorPI_GetCaptureLog(uint8_t *buf, uint8_t *entriesOut)
     *entriesOut = n;
 }
 
-void SectorPI_TelemGet(V4_TELEM_T *out)
+void SectorPI_TelemGet(TELEM_T *out)
 {
     out->timerPeriod     = timerPeriod;
     out->integrator      = integrator;
-    out->lastCapValue    = v4_lastCaptureHR;
+    out->lastCapValue    = lastCaptureHR_g;
     out->actualAmplitude = actualAmplitude;
     out->measuredSpeed   = measuredSpeed;
     out->position        = position;
@@ -1423,54 +1032,35 @@ void SectorPI_TelemGet(V4_TELEM_T *out)
     out->diagPiRuns      = diagPiRuns;
     out->diagLastCapValue = diagLastCapValue;
     out->diagDelta       = diagDelta;
-    out->spMode          = v4_spActive;
-    out->spRequest       = v4_spRequest;
+    out->spMode          = false;
+    out->spRequest       = false;
     {
         uint16_t erpmPeriod = actualStepPeriodHR ? actualStepPeriodHR : timerPeriod;
         out->erpmNow = (erpmPeriod > 0) ?
-            (60UL * V4_TIMER_FREQ_HZ / (6UL * (uint32_t)erpmPeriod)) : 0;
+            (60UL * SECTOR_TIMER_FREQ_HZ / (6UL * (uint32_t)erpmPeriod)) : 0;
     }
     /* Capture-rate diagnostics — pull from garuda_service.c (ADC ISR side)
      * and the local Commutate counter. Lets the GUI/CSV diagnose where the
      * 50% capture loss is happening. */
     {
-        extern volatile uint32_t v4_adcBlankReject;
-        extern volatile uint32_t v4_adcStateMismatch;
-        extern volatile uint32_t v4_adcCaptureSet;
-        extern volatile uint32_t v4_adcSetRising;
-        extern volatile uint32_t v4_adcAlreadySet;
-        out->adcBlankReject     = v4_adcBlankReject;
-        out->adcStateMismatch   = v4_adcStateMismatch;
-        out->adcCaptureSet      = v4_adcCaptureSet;
-        out->adcSetRising       = v4_adcSetRising;
-        out->adcAlreadySet      = v4_adcAlreadySet;
+        extern volatile uint32_t adcBlankReject;
+        extern volatile uint32_t adcStateMismatch;
+        extern volatile uint32_t adcCaptureSet;
+        out->adcBlankReject     = adcBlankReject;
+        out->adcStateMismatch   = adcStateMismatch;
+        out->adcCaptureSet      = adcCaptureSet;
         out->commutateNoCapture = diagCommutateNoCapture;
-        extern volatile uint32_t v4_offMidCapture;
-        extern volatile uint32_t v4_offMidMismatch;
-        out->offMidCapture  = v4_offMidCapture;
-        out->offMidMismatch = v4_offMidMismatch;
-#if FEATURE_V5_PTG_ZC
-        extern volatile uint32_t v5_ptgFires, v5_ptgRisingAcc, v5_ptgRisingRej;
-        extern volatile uint32_t v5_ptgFallingAcc, v5_ptgFallingRej;
-        out->ptgFires       = v5_ptgFires;
-        out->ptgRisingAcc   = v5_ptgRisingAcc;
-        out->ptgRisingRej   = v5_ptgRisingRej;
-        out->ptgFallingAcc  = v5_ptgFallingAcc;
-        out->ptgFallingRej  = v5_ptgFallingRej;
-#else
-        out->ptgFires = out->ptgRisingAcc = out->ptgRisingRej =
-            out->ptgFallingAcc = out->ptgFallingRej = 0;
-#endif
-        extern volatile uint32_t v5_postZcRisingAcc;
-        extern volatile uint32_t v5_postZcRisingRej;
-        extern volatile uint32_t v5_postZcFallingAcc;
-        extern volatile uint32_t v5_postZcFallingRej;
-        out->postZcRisingAcc  = v5_postZcRisingAcc;   /* 0 when V5_POST_ZC=0 */
-        out->postZcRisingRej  = v5_postZcRisingRej;
-        out->postZcFallingAcc = v5_postZcFallingAcc;
-        out->postZcFallingRej = v5_postZcFallingRej;
-        out->tMeasHR          = v5_tMeasHRSmooth;      /* smoothed; 0 when V5_MEAS=0 */
+        extern volatile uint32_t ptgFires;
+        out->ptgFires = ptgFires;
+        extern volatile uint32_t postZcRisingAcc;
+        extern volatile uint32_t postZcRisingRej;
+        extern volatile uint32_t postZcFallingAcc;
+        extern volatile uint32_t postZcFallingRej;
+        out->postZcRisingAcc  = postZcRisingAcc;
+        out->postZcRisingRej  = postZcRisingRej;
+        out->postZcFallingAcc = postZcFallingAcc;
+        out->postZcFallingRej = postZcFallingRej;
+        out->tMeasHR          = tMeasHRSmooth;      /* smoothed; 0 when MEAS_PI=0 */
     }
 }
 
-#endif /* FEATURE_V4_SECTOR_PI */

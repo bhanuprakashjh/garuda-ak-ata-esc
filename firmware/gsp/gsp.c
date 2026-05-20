@@ -1,8 +1,7 @@
 /**
  * @file gsp.c
- * @brief GSP v2 protocol engine for dsPIC33CK — ring buffers, parser, CRC.
+ * @brief GSP v2 protocol engine — ring buffers, parser, CRC.
  *
- * Adapted from dsPIC33AK GSP for dsPIC33CK64MP205 UART1 registers.
  * Packet format: [0x02] [LEN] [CMD_ID] [PAYLOAD...] [CRC16_H] [CRC16_L]
  * All RX/TX is polled from main loop (no ISR-driven UART).
  */
@@ -23,20 +22,31 @@
 
 #define GSP_START_BYTE        0x02
 #define GSP_RX_RING_SIZE      256
-#define GSP_TX_RING_SIZE      256
+#define GSP_TX_RING_SIZE      512  /* Telemetry frame is 257 bytes
+                                    * (STX + LEN + CMD + 252-byte payload
+                                    * + CRC×2). 256-byte ring rejects a
+                                    * 257-byte frame at the txFree check. */
 #define GSP_RX_RING_MASK      (GSP_RX_RING_SIZE - 1)
 #define GSP_TX_RING_MASK      (GSP_TX_RING_SIZE - 1)
-#define GSP_MAX_PAYLOAD_LEN   251  /* 2026-05-15: bumped from 249 for the
-                                      * 250-byte multi-phase BEMF tally
-                                      * snapshot.  LEN field is uint8 so
-                                      * any value ≤ 254 fits the wire. */
+#define GSP_MAX_PAYLOAD_LEN   200  /* Sized for the 180-byte telemetry
+                                      * snapshot (seq + 250 d-bytes incl.
+                                      * fpStaleCount tail). LEN field is
+                                      * uint8 so any value ≤ 254 fits. */
 #define GSP_PARSER_TIMEOUT_MS 100
 #define GSP_MAX_CMDS_PER_SVC  1
 
 /* ── Ring buffer types ───────────────────────────────────────────── */
 
+/* RX and TX rings share the same RING_T but have different MASK values
+ * (GSP_RX_RING_MASK = 255, GSP_TX_RING_MASK = 511). The buffer MUST be
+ * sized to the *larger* of the two, otherwise RingPut on txRing wraps
+ * head at 512 against a 256-byte buffer and writes 256..511 land in
+ * adjacent BSS (the `parser` struct), corrupting parser.state /
+ * pktBuf / pktLen and producing apparent "memory corruption, PC jumps
+ * somewhere" symptoms. rxRing wastes 256 bytes of unused space; cheap. */
+#define GSP_RING_BUF_SIZE     GSP_TX_RING_SIZE
 typedef struct {
-    uint8_t  buf[GSP_RX_RING_SIZE];
+    uint8_t  buf[GSP_RING_BUF_SIZE];
     uint16_t head;
     uint16_t tail;
 } RING_T;
@@ -69,12 +79,8 @@ static PARSER_T parser;
 /* Access systemTick */
 #include "../garuda_service.h"
 #include "../garuda_config.h"
-#if FEATURE_V4_SECTOR_PI
-extern volatile uint32_t gV4SystemTick;
-#define GSP_SYSTEM_TICK  gV4SystemTick
-#else
-#define GSP_SYSTEM_TICK  gData.systemTick
-#endif
+extern volatile uint32_t gSystemTick;
+#define GSP_SYSTEM_TICK  gSystemTick
 
 /* ── CRC-16-CCITT ────────────────────────────────────────────────── */
 
@@ -146,9 +152,9 @@ static inline void UART1_RxOverflowClear(void)
 
 static void PumpRx(void)
 {
-    /* On dsPIC33CK, OERR halts the receiver. Must clear OERR and drain
-     * any stale bytes before normal operation resumes. Without the drain,
-     * URXBE can stay deasserted (not empty) indefinitely → infinite loop. */
+    /* OERR halts the receiver — clear OERR and drain any stale bytes
+     * before normal operation resumes. Without the drain, URXBE can
+     * stay deasserted (not empty) indefinitely → infinite loop. */
     if (UART1_RxOverflow()) {
         UART1_RxOverflowClear();
         /* Drain stale bytes (max 4 in HW FIFO) */

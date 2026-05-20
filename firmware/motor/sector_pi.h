@@ -1,6 +1,6 @@
 /**
  * @file sector_pi.h
- * @brief V4 Sector PI motor control — AVR-style synchronizer.
+ * @brief Sector PI motor control — AVR-style synchronizer.
  *
  * Ground-up rewrite modeled on Microchip AVR high-speed motor control.
  * PI always owns commutation scheduling. No poll, no DMA, no modes.
@@ -11,16 +11,15 @@
 
 #include "../garuda_config.h"
 
-#if FEATURE_V4_SECTOR_PI
 
 #include <stdint.h>
 #include <stdbool.h>
 
 /* Motor status events (matches AVR motor_status_t) */
-#define V4_EVENT_STALL      (1U << 1)
-#define V4_EVENT_FAULT      (1U << 2)
+#define EVENT_STALL      (1U << 1)
+#define EVENT_FAULT      (1U << 2)
 
-/* V4 telemetry snapshot */
+/* Telemetry snapshot */
 typedef struct {
     uint16_t timerPeriod;
     uint16_t integrator;
@@ -44,23 +43,15 @@ typedef struct {
      * 32-bit — ADC fires at 40kHz so uint16 wraps every ~1.6s. */
     uint32_t adcBlankReject;        /* ADC fired pre-blanking-end */
     uint32_t adcStateMismatch;      /* past blanking, GPIO != expected */
-    uint32_t adcCaptureSet;         /* set v4_captureValid (candidate) */
-    uint32_t adcSetRising;          /* subset of adcCaptureSet on rising-ZC sectors (0,2,4) */
-    uint32_t adcAlreadySet;         /* skipped — already true */
+    uint32_t adcCaptureSet;         /* set captureValid (candidate) */
     uint32_t commutateNoCapture;    /* Commutate found capValue == SENTINEL */
-    uint32_t offMidCapture;         /* falling ZC confirmed at PWM OFF-mid */
-    uint32_t offMidMismatch;        /* falling ZC wrong at PWM OFF-mid */
-    uint32_t ptgFires;              /* V5.0: _PTG0Interrupt fire count */
-    uint32_t ptgRisingAcc;          /* V5.0: rising-sector samples post-ZC */
-    uint32_t ptgRisingRej;
-    uint32_t ptgFallingAcc;         /* V5.0: falling-sector samples post-ZC */
-    uint32_t ptgFallingRej;
-    uint32_t postZcRisingAcc;       /* V5.1: ADC ISR post-ZC shadow counters */
+    uint32_t ptgFires;              /* _PTG0Interrupt fire count (heartbeat) */
+    uint32_t postZcRisingAcc;       /* ADC ISR post-ZC shadow counters */
     uint32_t postZcRisingRej;
     uint32_t postZcFallingAcc;
     uint32_t postZcFallingRej;
-    uint16_t tMeasHR;               /* V5.2: smoothed commutation interval */
-} V4_TELEM_T;
+    uint16_t tMeasHR;               /* smoothed commutation interval */
+} TELEM_T;
 
 void     SectorPI_Init(void);
 void     SectorPI_Start(uint16_t vbusRaw);
@@ -70,7 +61,7 @@ void     SectorPI_Commutate(void);    /* Call from SCCP3 ISR during CL */
 void     SectorPI_TimeTick(void);     /* Call at 1ms for speed measurement + amplitude */
 void     SectorPI_CommandSet(uint16_t amplitude);
 uint32_t SectorPI_ErpmGet(void);
-void     SectorPI_TelemGet(V4_TELEM_T *out);
+void     SectorPI_TelemGet(TELEM_T *out);
 bool     SectorPI_IsRunning(void);
 uint8_t  SectorPI_GetPhase(void);     /* 0=OFF, 1=ALIGN, 2=OL_RAMP, 3=CL */
 
@@ -80,7 +71,6 @@ uint8_t  SectorPI_GetPhase(void);     /* 0=OFF, 1=ALIGN, 2=OL_RAMP, 3=CL */
  * count copied. Caller must size buf >= 30*8 = 240 bytes. */
 void     SectorPI_GetCaptureLog(uint8_t *buf, uint8_t *entriesOut);
 
-#endif /* FEATURE_V4_SECTOR_PI */
 
 /* ── Single-Pulse mode shared state ────────────────────────────── */
 /* g_pwmPer: current PWM period in TCY units.
@@ -88,6 +78,32 @@ void     SectorPI_GetCaptureLog(uint8_t *buf, uint8_t *entriesOut);
  * Updated by SectorPI_TimeTick — NOT by the Commutate ISR.
  * The ISR reads it for duty scaling with zero branch overhead. */
 extern volatile uint16_t g_pwmPer;
+
+/* ── Atomic per-sector snapshot (PTG ↔ Commutate race-safe) ─────
+ * Single 16-bit word written atomically by SectorPI_Commutate (IPL 6),
+ * read once at the top of ProcessBemfSample. PTG (IPL 4) cannot
+ * preempt itself, so a single 16-bit load yields a coherent triple.
+ *
+ *   bits 0..2  currentSector  (0..5)
+ *   bits 3..4  floatingPhase  (0..2)
+ *   bit  5     ptgExpectedComp (0..1) */
+extern volatile uint16_t sectorSnap;
+
+/* SCCP4-domain timestamp of the most recent commutation. Read-only
+ * outside SectorPI_Commutate. */
+extern volatile uint16_t lastCommHR;
+
+/* Latest accepted BEMF capture (SCCP4 HR domain). Written by
+ * ProcessBemfSample when its deglitch + polarity gate accepts a
+ * sample; consumed by SectorPI_OlTick and SectorPI_Commutate. The
+ * captureValid flag re-arms (cleared) after each Commutate consumes
+ * the timestamp. */
+extern volatile uint16_t lastCaptureHR_g;
+extern volatile bool     captureValid;
+
+#define SECTOR_SNAP_SECT(w)  ((uint8_t)((w) & 0x7u))
+#define SECTOR_SNAP_FP(w)    ((uint8_t)(((w) >> 3) & 0x3u))
+#define SECTOR_SNAP_EXP(w)   ((uint8_t)(((w) >> 5) & 0x1u))
 
 #endif /* SECTOR_PI_H */
 

@@ -1,6 +1,6 @@
 /**
  * @file gsp_commands.h
- * @brief GSP v2 command IDs and CK board wire-format structures.
+ * @brief GSP v2 command IDs and wire-format structures.
  *
  * Protocol-compatible with dsPIC33AK board. Same packet format, CRC,
  * and command IDs. Different snapshot struct (CK 6-step vs AK FOC).
@@ -50,7 +50,7 @@ typedef enum {
     GSP_CMD_BURST_ARM       = 0x20,   /* arm the burst; no payload */
     GSP_CMD_BURST_STATUS    = 0x21,   /* response: {state, count} 2 bytes */
     GSP_CMD_BURST_GET_STEP  = 0x22,   /* payload: {stepIdx}; response: DMA_BURST_STEP_T */
-    /* V4 PI capture-log: first 30 PI runs after CL entry, frozen.
+    /* PI capture-log: first 30 PI runs after CL entry, frozen.
      * Response: [count(u8)][entries 8B each: timerPeriod, setValue,
      * capValue, delta_clamped — all LE]. */
     GSP_CMD_PI_LOG          = 0x30,
@@ -59,8 +59,8 @@ typedef enum {
      * shared with motor-start path). */
     GSP_CMD_ATA_DIAG        = 0x40,
     /* BEMF GPIO state inspection. Safe in any state — pure GPIO read.
-     * Response: [BEMF_A, BEMF_B, BEMF_C, v4_floatingPhase,
-     *            v5_ptgExpectedComp, current_step, currentRisingZc]. */
+     * Response: [BEMF_A, BEMF_B, BEMF_C, floatingPhase,
+     *            ptgExpectedComp, current_step, currentRisingZc]. */
     GSP_CMD_BEMF_PROBE      = 0x41,
     GSP_CMD_TELEM_FRAME     = 0x80,
     GSP_CMD_ERROR           = 0xFF
@@ -85,14 +85,14 @@ typedef struct __attribute__((packed)) {
     uint8_t  fwMajor;
     uint8_t  fwMinor;
     uint8_t  fwPatch;
-    uint16_t boardId;           /* 0x0002 for CK board */
+    uint16_t boardId;           /* 0x0002 (was CK board, retained for GUI compat) */
     uint8_t  motorProfile;      /* 0=Hurst, 1=A2212, 2=2810 */
     uint8_t  motorPolePairs;
     uint32_t featureFlags;      /* CK-specific feature bits */
     uint32_t pwmFrequency;
     uint32_t maxErpm;
     uint32_t buildHash;         /* djb2 hash of __DATE__ " " __TIME__ +
-                                 * folded V4 tunables (advance, blanking,
+                                 * folded tunables (advance, blanking,
                                  * Kp/Ki shifts).  Bumps every recompile. */
 } GSP_INFO_T;
 
@@ -108,7 +108,7 @@ typedef struct __attribute__((packed)) {
 #define GSP_FEATURE_GSP         (1UL << 16)  /* GSP protocol active */
 
 /**
- * GSP_CK_SNAPSHOT_T — 64 bytes, CK board telemetry snapshot.
+ * GSP_SNAPSHOT_T — 64 bytes, telemetry snapshot.
  *
  * V1: 48 bytes (core + electrical + speed + ZC diag + system)
  * V2: 52 bytes (+zcLatencyPct, zcBlankPct, zcBypassCount)
@@ -296,10 +296,10 @@ typedef struct __attribute__((packed)) {
     int16_t  iaAtFaultInst, ibAtFaultInst, ibusAtFaultInst;
     uint8_t  faultSnapshotValid;
     uint8_t  _padPeaks;               /* align to 2 bytes */
-} GSP_CK_SNAPSHOT_T;
+} GSP_SNAPSHOT_T;
 
 /* XC16 doesn't support _Static_assert. Verify size at compile time:
- * sizeof(GSP_CK_SNAPSHOT_T) should be 48 bytes. */
+ * sizeof(GSP_SNAPSHOT_T) should be 48 bytes. */
 
 /* Command handler prototype */
 typedef void (*GSP_CMD_HANDLER_T)(const uint8_t *payload, uint8_t payloadLen);

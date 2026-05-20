@@ -1,20 +1,13 @@
 /**
  * @file port_config.h
- * @brief GPIO and PPS configuration for EV92R69A + EV68M17A (AK port).
+ * @brief GPIO and PPS configuration for EV92R69A + EV68M17A.
  *
- * Forked from CK `../../garuda_6step_ck.X/hal/port_config.h`.  Pin
- * macros below are dsPIC33AK128MC106 pin assignments based on:
+ * dsPIC33AK128MC106 pin assignments derived from:
  *   - EV92R69A user guide (DS50003904) appendix A.3 — DIM connector
  *     schematic shows which DIM pins carry ATA6847L SPI/nIRQ + BEMF.
  *   - EV68M17A DIM info sheet (DS70005527) §5 — DIM↔AK pin map.
  *
- * [AK PORT] OPEN ITEMS (re-check after Phase 0 multimeter probe):
- *   - nCS / GATE_DVR_ENABLE: schematic shows DIM 6 or 8 (ambiguous).
- *     Probed value goes here. Two candidates: RC2/RP35 or RC5/RP38.
- *   - LED + button pins: copied from EV43F54A as placeholders; the
- *     AK DIM mounts differently on EV92R69A — confirm before flashing.
- *   - PWM pins: PG1H/L=RD2/RD3, PG2H/L=RD0/RD1, PG3H/L=RC3/RC4 per the
- *     dspic33AKESC sibling project; same DIM here.
+ * PWM: PG1H/L=RD2/RD3, PG2H/L=RD0/RD1, PG3H/L=RC3/RC4.
  */
 #ifndef HAL_PORT_CONFIG_H
 #define HAL_PORT_CONFIG_H
@@ -70,7 +63,7 @@
 #define BEMF_B_GetValue()   _RB8
 #define BEMF_C_GetValue()   _RA10
 
-/* RP numbers for PPS routing of BEMF GPIO → CCPx IC input (V4 CCP
+/* RP numbers for PPS routing of BEMF GPIO → CCPx IC input (CCP
  * diag path; off by default but sector_pi.c references the constants). */
 #define BEMF_A_RP           26U
 #define BEMF_B_RP           25U
